@@ -1,5 +1,5 @@
 ![planet voxel octree LOD](/banner.png)
 
-"Let the planets begin"
+"Let the planets begin" —— Paper
 
-[Abdiel Lopez]
+"They never began, you abondoned them" —— Wulferis

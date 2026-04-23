@@ -25,7 +25,7 @@ public class WorldModifications : MonoBehaviour
     public enum VoxelState : byte
     {
         Solid = 0,  // player placed a block here
-        Air   = 1,  // player dug this block out
+        Air = 1,  // player dug this block out
     }
 
     // Main storage: wrapped voxel position → state override
@@ -76,12 +76,20 @@ public class WorldModifications : MonoBehaviour
     /// so the array stays small for each individual job.
     /// </summary>
     public void GetModificationsForNode(
-        Vector3 nodeWorldPos, float nodeScale,
+        Vector3 nodeWorldPos, float nodeScale, int chunkResolution,
         out Vector3Int[] keys, out VoxelState[] values)
     {
-        float half = nodeScale * 0.5f;
-        var kList  = new List<Vector3Int>();
-        var vList  = new List<VoxelState>();
+        // Expand the AABB by exactly 1 voxel on every side.
+        // When the NodeJob checks a neighbour voxel that sits just outside
+        // this chunk's border (local index = -1 or chunkResolution), it
+        // converts that to a world position and calls IsAirWorldPos, which
+        // looks up modKeys. Without the expansion, modifications in the
+        // adjacent chunk are not in modKeys, so the job falls back to noise
+        // and renders a phantom face / missing face on the seam.
+        float voxelSize = nodeScale / chunkResolution;
+        float half = nodeScale * 0.5f + voxelSize;   // +1 voxel border
+        var kList = new List<Vector3Int>();
+        var vList = new List<VoxelState>();
 
         foreach (var kv in modifications)
         {
@@ -97,7 +105,7 @@ public class WorldModifications : MonoBehaviour
             }
         }
 
-        keys   = kList.ToArray();
+        keys = kList.ToArray();
         values = vList.ToArray();
     }
 

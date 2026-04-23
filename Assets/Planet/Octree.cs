@@ -1,16 +1,6 @@
-using System.Collections.Generic;
+ï»¿using System.Collections.Generic;
 using UnityEngine;
 
-/// <summary>
-/// A single cell in the OctreeGrid.
-///
-/// Differences from the standalone version:
-/// • No Update/LateUpdate — ticked by OctreeGrid.
-/// • Tick() collects pending JobCompleters into a shared list owned by
-///   OctreeGrid, which sorts them by distance and applies the global budget.
-/// • Each JobCompleter now carries a cancel callback so the grid can safely
-///   discard jobs that exceed the budget without leaving nodes locked.
-/// </summary>
 public class Octree : MonoBehaviour
 {
     [HideInInspector] public float worldSizeX;
@@ -19,18 +9,23 @@ public class Octree : MonoBehaviour
     [HideInInspector] public float surfaceNoiseAmplitude;
     [HideInInspector] public int divisions;
     [HideInInspector] public int chunkResolution;
-    [HideInInspector] public float innerRadiusPadding;
     [HideInInspector] public int maxNodeCreationsPerFrame;
     [HideInInspector] public Transform priority;
     [HideInInspector] public GameObject chunkPrefab;
     [HideInInspector] public Vector3 cellOrigin;
 
+    /// <summary>
+    /// Per-level subdivision radii baked by OctreeGrid from lodDistanceCurve.
+    /// Index 0 = finest level (divisions==1).
+    /// Index divisions-1 = coarsest (root).
+    /// Node subdivides when player is closer than lodRadii[level] to its AABB.
+    /// </summary>
+    [HideInInspector] public float[] lodRadii;
+
     [HideInInspector] public Node root;
 
     private bool initialised = false;
 
-    // -----------------------------------------------------------------------
-    //  Lifecycle
     // -----------------------------------------------------------------------
 
     public void Initialize()
@@ -45,16 +40,11 @@ public class Octree : MonoBehaviour
         initialised = true;
     }
 
-    /// <summary>
-    /// Called every Update by OctreeGrid.
-    /// Traverses the tree and collects pending jobs into <paramref name="jobList"/>.
-    /// Each job is tagged with its squared distance to the player so the grid
-    /// can sort and apply the global budget in LateUpdate.
-    /// </summary>
     public void Tick(List<OctreeGrid.PrioritizedJob> jobList, Vector3 playerPos)
     {
         if (!initialised) return;
-        Traverse(root, 0);
+        int creations = 0;
+        Traverse(root, playerPos, ref creations);
         CollectJobs(root, jobList, playerPos);
     }
 
@@ -70,17 +60,17 @@ public class Octree : MonoBehaviour
     //  Traversal
     // -----------------------------------------------------------------------
 
-    private void Traverse(Node node, int creations)
+    private void Traverse(Node node, Vector3 playerPos, ref int creations)
     {
         if (creations > maxNodeCreationsPerFrame) return;
 
         if (node.divisions > 1)
         {
-            if (ShouldSubdivide(node))
+            if (ShouldSubdivide(node, playerPos))
             {
-                node.Clear();
                 if (node.children == null)
                 {
+                    node.Clear();
                     node.children = new Node[8];
                     for (int i = 0; i < 8; i++)
                         node.children[i] = new Node(this, node, Tables.Offsets[i], node.divisions - 1);
@@ -89,41 +79,68 @@ public class Octree : MonoBehaviour
             }
             else
             {
-                DeleteChildren(node);
+                if (node.children != null)
+                {
+                    node.MarkDirty();
+                    DeleteChildren(node);
+                }
             }
 
             if (node.children != null)
                 for (int i = 0; i < 8; i++)
-                    Traverse(node.children[i], creations);
+                    Traverse(node.children[i], playerPos, ref creations);
         }
     }
 
-    private bool ShouldSubdivide(Node node)
-    {
-        Vector3 center = node.NodePosition();
-        float halfSize = node.NodeScale() * innerRadiusPadding + 1f;
-        Vector3 pp = priority.position;
-        Vector3 min = center - Vector3.one * halfSize;
-        Vector3 max = center + Vector3.one * halfSize;
+    // -----------------------------------------------------------------------
+    //  LOD decision â€” AABB distance, not center distance
+    // -----------------------------------------------------------------------
 
-        return pp.x >= min.x && pp.x <= max.x
-            && pp.y >= min.y && pp.y <= max.y
-            && pp.z >= min.z && pp.z <= max.z;
+    /// <summary>
+    /// Squared distance from the player to the nearest point on the node's AABB.
+    /// Returns 0 when the player is inside the node.
+    ///
+    /// Why AABB and not center?
+    /// A node 1024 units wide has its center up to ~866 units from a corner.
+    /// If the player stands just inside that corner, center-distance would be
+    /// ~866 units, likely beyond any subdivision radius â€” so the node never
+    /// subdivides even with the player standing in it. AABB distance is 0 in
+    /// that case, guaranteeing subdivision regardless of node size.
+    /// </summary>
+    private static float AabbSqrDist(Node node, Vector3 p)
+    {
+        Vector3 c = node.NodePosition();
+        float h = node.NodeScale() * 0.5f;
+
+        float dx = Mathf.Max(0f, Mathf.Abs(p.x - c.x) - h);
+        float dy = Mathf.Max(0f, Mathf.Abs(p.y - c.y) - h);
+        float dz = Mathf.Max(0f, Mathf.Abs(p.z - c.z) - h);
+
+        return dx * dx + dy * dy + dz * dz;
+    }
+
+    private bool ShouldSubdivide(Node node, Vector3 playerPos)
+    {
+        int level = node.divisions - 1; // 0 = finest, divisions-1 = coarsest
+        float radius = (lodRadii != null && level < lodRadii.Length)
+            ? lodRadii[level]
+            : node.NodeScale() * 2f;   // fallback
+
+        return AabbSqrDist(node, playerPos) < radius * radius;
     }
 
     // -----------------------------------------------------------------------
-    //  Job collection  (replaces the old Schedule + LateUpdate pattern)
+    //  Job collection
     // -----------------------------------------------------------------------
 
     private void CollectJobs(Node node, List<OctreeGrid.PrioritizedJob> jobList, Vector3 playerPos)
     {
         if (node.TryCollectJob(out JobCompleter completer))
         {
-            float sqrDist = (node.NodePosition() - playerPos).sqrMagnitude;
             jobList.Add(new OctreeGrid.PrioritizedJob
             {
                 completer = completer,
-                sqrDistToPlayer = sqrDist,
+                sqrDistToPlayer = AabbSqrDist(node, playerPos),
             });
         }
 

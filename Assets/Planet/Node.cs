@@ -162,7 +162,7 @@ public class Node
             return;
         }
 
-        wm.GetModificationsForNode(nodePos, scale,
+        wm.GetModificationsForNode(nodePos, scale, octree.chunkResolution,
             out Vector3Int[] kArr, out WorldModifications.VoxelState[] vArr);
 
         keys = new NativeArray<int3>(kArr.Length, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);

@@ -255,13 +255,13 @@ Transform:
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 705507993}
   serializedVersion: 2
-  m_LocalRotation: {x: 0.40821788, y: -0.23456968, z: 0.10938163, w: 0.8754261}
+  m_LocalRotation: {x: 0.74261844, y: -0.16550727, z: 0.19898397, w: 0.6176817}
   m_LocalPosition: {x: 0, y: 3, z: 0}
   m_LocalScale: {x: 1, y: 1, z: 1}
   m_ConstrainProportionsScale: 0
   m_Children: []
   m_Father: {fileID: 0}
-  m_LocalEulerAnglesHint: {x: 50, y: -30, z: 0}
+  m_LocalEulerAnglesHint: {x: 100.494995, y: -30, z: 0}
 --- !u!1 &843519065
 GameObject:
   m_ObjectHideFlags: 0
@@ -592,7 +592,7 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::BlockInteraction
   playerCamera: {fileID: 963194227}
-  octree: {fileID: 0}
+  octreeGrid: {fileID: 1650284250}
   reach: 10
   terrainLayer:
     serializedVersion: 2
@@ -630,9 +630,32 @@ MonoBehaviour:
   worldSizeZ: 50000
   surfaceBaseHeight: 0
   surfaceNoiseAmplitude: 64
-  divisions: 7
+  divisions: 8
   chunkResolution: 16
-  innerRadiusPadding: 2
+  lodDistanceCurve:
+    serializedVersion: 2
+    m_Curve:
+    - serializedVersion: 3
+      time: 1.4835968
+      value: 4.9958496
+      inSlope: 1.6629064
+      outSlope: 1.6629064
+      tangentMode: 34
+      weightedMode: 0
+      inWeight: 0
+      outWeight: 0.33333334
+    - serializedVersion: 3
+      time: 3.3247323
+      value: 8.057486
+      inSlope: 1.6629064
+      outSlope: 1.6629064
+      tangentMode: 34
+      weightedMode: 0
+      inWeight: 0.33333334
+      outWeight: 0
+    m_PreInfinity: 2
+    m_PostInfinity: 2
+    m_RotationOrder: 4
   renderRadius: 10
   maxJobsPerFrame: 120
   newCellsPerFrame: 3

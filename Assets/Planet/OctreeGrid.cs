@@ -11,61 +11,73 @@ using Unity.Jobs;
 /// • Configurable render distance (renderRadius cells in each direction).
 /// • Global per-frame job budget shared across ALL active octrees.
 ///   Jobs are sorted by distance to the player so closer chunks mesh first.
-/// • New cells are introduced one per frame to spread the load when the
-///   player crosses a cell boundary.
-/// • Cells leaving the radius are destroyed immediately (their geometry is gone
-///   from the player's view so the cost is zero).
+/// • Predictive generation: the load centre is shifted ahead of the player
+///   proportional to speed, so chunks are ready before the player arrives.
+/// • New cells are introduced gradually to avoid frame spikes.
+/// • Cells leaving the radius are destroyed immediately.
+///
+/// RECOMMENDED SETTINGS FOR A 50 KM WORLD
+/// ────────────────────────────────────────
+///   worldSizeX / worldSizeZ : 50000
+///   divisions               : 7        (cell size ≈ 1024 units at chunkRes=8)
+///   chunkResolution         : 8
+///   renderRadius            : 6        (13×13 = 169 cells, ~13 km view distance)
+///   maxJobsPerFrame         : 120
+///   newCellsPerFrame        : 3
+///   predictionDistance      : 3        (cells ahead to pre-load)
+///   predictionSpeedThreshold: 20       (units/s before prediction kicks in)
+///   surfaceNoiseAmplitude   : 300      (taller mountains for a bigger world)
 ///
 /// SETUP
 /// ─────
-/// 1. Create a GameObject → name it "OctreeGrid".
-/// 2. Add Component → OctreeGrid.
-/// 3. Fill in the Inspector:
-///      priority              → player Transform
-///      chunkPrefab           → prefab with MeshFilter + MeshRenderer
-///      renderRadius          → cells in each direction (3=7×7, 8=17×17, …)
-///      maxJobsPerFrame       → how many chunk jobs to COMPLETE per frame
-///                              (50–200 is a good range; lower = smoother,
-///                               higher = faster initial load)
-///      newCellsPerFrame      → how many new octree cells to activate per frame
-///                              when the player moves (1–3 recommended)
-///      worldSizeX/Z          → wrap period in world units
-///      divisions             → octree depth per cell (keep 6–8 for good LOD)
-///      chunkResolution       → voxels per chunk side
-///      surfaceBaseHeight     → Y of sea level
-///      surfaceNoiseAmplitude → max terrain height
-/// 4. Add a WorldModifications component to any scene GameObject.
-/// 5. Point BlockInteraction.octreeGrid at this component.
+/// 1. Create a GameObject → "OctreeGrid" → Add Component → OctreeGrid.
+/// 2. Fill in the Inspector fields above.
+/// 3. Add a WorldModifications component to any scene GameObject.
+/// 4. Point BlockInteraction.octreeGrid at this component.
 /// </summary>
 public class OctreeGrid : MonoBehaviour
 {
-    [Header("World")]
-    public float worldSizeX = 4096f;
-    public float worldSizeZ = 4096f;
+    [Header("World  (50 km planet example: worldSizeX = worldSizeZ = 50000)")]
+    public float worldSizeX = 50000f;
+    public float worldSizeZ = 50000f;
 
     [Header("Terrain")]
     public float surfaceBaseHeight = 0f;
-    public float surfaceNoiseAmplitude = 64f;
+    [Tooltip("Max terrain height. Scale up for larger worlds (300+ for 50 km).")]
+    public float surfaceNoiseAmplitude = 300f;
 
     [Header("Octree per cell")]
+    [Tooltip("Octree depth. 7 with chunkResolution=8 gives ~1024 unit cells.")]
     public int divisions = 7;
-    public int chunkResolution = 16;
+    [Tooltip("Voxels per chunk side. Lower = smaller cells = smoother streaming.")]
+    public int chunkResolution = 8;
     public float innerRadiusPadding = 2f;
 
     [Header("Render Distance & Performance")]
-    [Tooltip("Cells loaded in every direction. 3=7×7, 5=11×11, 10=21×21.")]
-    public int renderRadius = 5;
+    [Tooltip("Cells loaded in each direction. 6 = 13×13 grid ≈ 13 km at 50km scale.")]
+    public int renderRadius = 6;
 
-    [Tooltip("Max chunk mesh jobs completed per frame across ALL cells. " +
-             "Lower = smoother framerate, higher = faster terrain appearance.")]
-    public int maxJobsPerFrame = 80;
+    [Tooltip("Max chunk mesh jobs completed per frame across ALL cells.")]
+    public int maxJobsPerFrame = 120;
 
-    [Tooltip("How many new octree cells to activate per frame when the player " +
-             "moves into a new grid cell. 1 = smoothest, higher = faster load.")]
-    public int newCellsPerFrame = 2;
+    [Tooltip("New octree cells activated per frame when player moves. 3 = fast load, smooth.")]
+    public int newCellsPerFrame = 3;
 
-    [Tooltip("Max octree node subdivisions created per cell per frame.")]
+    [Tooltip("Max octree node subdivisions per cell per frame.")]
     public int maxNodeCreationsPerFrame = 50;
+
+    [Header("Predictive Loading")]
+    [Tooltip("How many extra cells ahead of the player to pre-load in the movement direction.\n" +
+             "Higher = less pop-in at speed, more memory used.\n" +
+             "0 = disabled. Recommended: 2–4.")]
+    public int predictionDistance = 3;
+
+    [Tooltip("Player speed (units/s) above which predictive loading activates.")]
+    public float predictionSpeedThreshold = 20f;
+
+    [Tooltip("How strongly the load centre shifts ahead. 1 = one full cell per " +
+             "predictionDistance unit of speed above threshold.")]
+    public float predictionStrength = 1f;
 
     [Header("References")]
     public Transform priority;
@@ -85,6 +97,12 @@ public class OctreeGrid : MonoBehaviour
 
     private float cellSize;
     private Vector2Int lastPlayerCell = new Vector2Int(int.MaxValue, int.MaxValue);
+    private Vector2Int lastLoadCentre = new Vector2Int(int.MaxValue, int.MaxValue);
+
+    // Velocity tracking for predictive loading
+    private Vector3 prevPlayerPos;
+    private Vector3 playerVelocity;      // smoothed world-space velocity
+    private const float VelocitySmooth = 0.15f; // lerp factor per frame
 
     // -----------------------------------------------------------------------
 
@@ -111,7 +129,10 @@ public class OctreeGrid : MonoBehaviour
 
         Debug.Log($"[OctreeGrid] cellSize={cellSize}  renderRadius={renderRadius}  " +
                   $"grid={(renderRadius * 2 + 1)}×{(renderRadius * 2 + 1)}  " +
-                  $"maxJobsPerFrame={maxJobsPerFrame}");
+                  $"maxJobsPerFrame={maxJobsPerFrame}  " +
+                  $"worldSize={worldSizeX}×{worldSizeZ}");
+
+        prevPlayerPos = priority.position;
 
         // Seed the pending queue immediately so the first cells load at start
         EnqueueDesiredCells(WorldToCell(priority.position));
@@ -120,12 +141,30 @@ public class OctreeGrid : MonoBehaviour
 
     private void Update()
     {
-        Vector2Int playerCell = WorldToCell(priority.position);
+        // --- Velocity tracking (smoothed) ---
+        Vector3 rawVelocity = (priority.position - prevPlayerPos) / Time.deltaTime;
+        playerVelocity = Vector3.Lerp(playerVelocity, rawVelocity, VelocitySmooth);
+        prevPlayerPos = priority.position;
 
+        // --- Predictive load centre ---
+        // Shift the grid centre ahead of the player in the movement direction,
+        // proportional to how fast they are moving above the threshold.
+        Vector2Int playerCell = WorldToCell(priority.position);
+        Vector2Int loadCentre = ComputeLoadCentre(playerCell);
+
+        // Refresh the grid whenever the LOAD CENTRE changes (not just playerCell),
+        // so predictive cells are created even before the player crosses a boundary.
+        if (loadCentre != lastLoadCentre)
+        {
+            lastLoadCentre = loadCentre;
+            EnqueueDesiredCells(loadCentre);
+        }
+
+        // Destroy cells that are out of range relative to PLAYER (not load centre)
+        // so we don't keep geometry that the player can no longer see.
         if (playerCell != lastPlayerCell)
         {
             lastPlayerCell = playerCell;
-            EnqueueDesiredCells(playerCell);
             DestroyOutOfRangeCells(playerCell);
         }
 
@@ -184,9 +223,11 @@ public class OctreeGrid : MonoBehaviour
 
     private void OnGUI()
     {
-        GUILayout.Label($"World repeats every {worldSizeX} × {worldSizeZ}  (toroidal)");
+        GUILayout.Label($"World: {worldSizeX} × {worldSizeZ} units  (toroidal)");
         GUILayout.Label($"Active cells: {activeCells.Count}  Pending: {pendingCells.Count}");
         GUILayout.Label($"Player: {priority.position}");
+        GUILayout.Label($"Speed: {playerVelocity.magnitude:F1} u/s  " +
+                        $"Prediction: {(playerVelocity.magnitude > predictionSpeedThreshold ? "ON" : "off")}");
         if (WorldModifications.Instance != null)
             GUILayout.Label($"Modifications: {WorldModifications.Instance.Count}");
     }
@@ -203,30 +244,67 @@ public class OctreeGrid : MonoBehaviour
     }
 
     // -----------------------------------------------------------------------
+    //  Predictive load centre
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// Returns the grid cell that should be used as the centre of the loaded
+    /// region.  When the player is moving fast enough, this is shifted ahead
+    /// in the movement direction so cells are ready before the player arrives.
+    ///
+    /// Example: player moving at 80 u/s with threshold=20, strength=1,
+    /// predictionDistance=3 → load centre shifts up to 3 cells ahead.
+    /// </summary>
+    private Vector2Int ComputeLoadCentre(Vector2Int playerCell)
+    {
+        if (predictionDistance <= 0) return playerCell;
+
+        float speed = playerVelocity.magnitude;
+        if (speed < predictionSpeedThreshold) return playerCell;
+
+        // How far ahead to shift, clamped to predictionDistance
+        float excess = (speed - predictionSpeedThreshold) * predictionStrength;
+        float shiftCells = Mathf.Clamp(excess / cellSize, 0f, predictionDistance);
+
+        // Direction of movement projected onto the XZ grid
+        Vector3 dir = playerVelocity.normalized;
+        float offX = dir.x * shiftCells;
+        float offZ = dir.z * shiftCells;
+
+        return new Vector2Int(
+            playerCell.x + Mathf.RoundToInt(offX),
+            playerCell.y + Mathf.RoundToInt(offZ)
+        );
+    }
+
+    // -----------------------------------------------------------------------
     //  Grid management
     // -----------------------------------------------------------------------
 
     /// <summary>
-    /// Fills pendingCells with every cell in the render radius that is not
-    /// already active, sorted nearest-first so they load in the right order.
+    /// Fills pendingCells with every cell in the render radius around
+    /// <paramref name="centre"/> that is not already active, sorted by
+    /// distance to the real player cell so nearby chunks always load first.
     /// </summary>
-    private void EnqueueDesiredCells(Vector2Int playerCell)
+    private void EnqueueDesiredCells(Vector2Int centre)
     {
-        // Collect missing cells with their distance
+        Vector2Int playerCell = WorldToCell(priority.position);
         var missing = new List<(Vector2Int cell, float sqrDist)>();
 
         for (int dx = -renderRadius; dx <= renderRadius; dx++)
             for (int dz = -renderRadius; dz <= renderRadius; dz++)
             {
-                var cell = new Vector2Int(playerCell.x + dx, playerCell.y + dz);
+                var cell = new Vector2Int(centre.x + dx, centre.y + dz);
                 if (!activeCells.ContainsKey(cell))
                 {
-                    float sqrDist = dx * dx + dz * dz;
-                    missing.Add((cell, sqrDist));
+                    // Order by distance to REAL player, not to the predicted centre,
+                    // so cells directly under the player always appear first.
+                    int pdx = cell.x - playerCell.x;
+                    int pdz = cell.y - playerCell.y;
+                    missing.Add((cell, pdx * pdx + pdz * pdz));
                 }
             }
 
-        // Sort nearest-first before enqueuing
         missing.Sort((a, b) => a.sqrDist.CompareTo(b.sqrDist));
         foreach (var (cell, _) in missing)
             pendingCells.Enqueue(cell);

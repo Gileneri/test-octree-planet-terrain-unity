@@ -1,4 +1,4 @@
-using UnityEngine;
+﻿using UnityEngine;
 using Unity.Jobs;
 using Unity.Collections;
 using Unity.Mathematics;
@@ -14,7 +14,7 @@ public class Node
 
     private MeshFilter meshFilter;
     private MeshRenderer meshRenderer;
-    private MeshCollider meshCollider;   // used for raycasting (block interaction)
+    private MeshCollider meshCollider;
 
     public bool IsScheduled => isScheduled;
     private bool isScheduled = false;
@@ -38,9 +38,6 @@ public class Node
 
         meshFilter = gameObject.GetComponent<MeshFilter>();
         meshRenderer = gameObject.GetComponent<MeshRenderer>();
-
-        // MeshCollider is optional in the prefab � we add it automatically if missing.
-        // It is required for Physics.Raycast (block breaking/placing) to work.
         meshCollider = gameObject.GetComponent<MeshCollider>();
         if (meshCollider == null)
             meshCollider = gameObject.AddComponent<MeshCollider>();
@@ -59,10 +56,6 @@ public class Node
         needsDrawn = true;
     }
 
-    /// <summary>
-    /// Called by BlockInteraction when a modification lands inside this node.
-    /// Forces a full re-mesh on the next Schedule() call.
-    /// </summary>
     public void MarkDirty()
     {
         meshFilter.mesh = null;
@@ -79,68 +72,81 @@ public class Node
     }
 
     // -----------------------------------------------------------------------
+    //  TryCollectJob — replaces TrySchedule
+    //
+    //  Prepares the NodeJob and returns a JobCompleter with three callbacks:
+    //    schedule   → called by OctreeGrid to start the Burst job
+    //    onComplete → called after JobHandle.CompleteAll to apply the mesh
+    //    cancel     → called when the budget drops this job; resets the node
+    //                 so it will be re-collected next frame
+    // -----------------------------------------------------------------------
 
-    public bool TrySchedule(out JobCompleter jobCompleter)
+    public bool TryCollectJob(out JobCompleter jobCompleter)
     {
-        if (IsLeaf() && needsDrawn && !isScheduled)
+        if (!IsLeaf() || !needsDrawn || isScheduled)
         {
-            var meshDataArray = Mesh.AllocateWritableMeshData(1);
-            var bounds = new Bounds(Vector3.zero, Vector3.one * NodeScale());
-            var nodePos = NodePosition();
-
-            BuildModificationArrays(nodePos, NodeScale(), out modKeys, out modValues);
-
-            var job = new NodeJob
-            {
-                meshDataArray = meshDataArray,
-                bounds = bounds,
-                worldSizeX = octree.worldSizeX,
-                worldSizeZ = octree.worldSizeZ,
-                surfaceBaseHeight = octree.surfaceBaseHeight,
-                surfaceNoiseAmplitude = octree.surfaceNoiseAmplitude,
-                chunkResolution = octree.chunkResolution,
-                nodeScale = NodeScale(),
-                worldNodePosition = nodePos,
-                modKeys = modKeys,
-                modValues = modValues,
-            };
-
-            isScheduled = true;
-            needsDrawn = false;
-
-            // Capture for the lambda
-            var capturedCollider = meshCollider;
-            var capturedFilter = meshFilter;
-
-            jobCompleter = new JobCompleter(
-                () => job.Schedule(),
-                () =>
-                {
-                    var mesh = new Mesh { name = "node_mesh", bounds = bounds };
-                    Mesh.ApplyAndDisposeWritableMeshData(meshDataArray, mesh);
-                    mesh.RecalculateNormals();
-
-                    // Apply to renderer
-                    capturedFilter.mesh = mesh;
-
-                    // Apply the same mesh to the collider so raycasts hit correctly.
-                    // MeshCollider.sharedMesh triggers a bake � this is the main-thread
-                    // cost of block interaction; for large nodes it can be slow.
-                    // If performance is a concern, consider cooking on a job using
-                    // Physics.BakeMesh() before assigning.
-                    capturedCollider.sharedMesh = mesh;
-
-                    isScheduled = false;
-
-                    if (modKeys.IsCreated) modKeys.Dispose();
-                    if (modValues.IsCreated) modValues.Dispose();
-                }
-            );
-            return true;
+            jobCompleter = null;
+            return false;
         }
 
-        jobCompleter = null;
-        return false;
+        var meshDataArray = Mesh.AllocateWritableMeshData(1);
+        var bounds = new Bounds(Vector3.zero, Vector3.one * NodeScale());
+        var nodePos = NodePosition();
+
+        BuildModificationArrays(nodePos, NodeScale(), out modKeys, out modValues);
+
+        var job = new NodeJob
+        {
+            meshDataArray = meshDataArray,
+            bounds = bounds,
+            worldSizeX = octree.worldSizeX,
+            worldSizeZ = octree.worldSizeZ,
+            surfaceBaseHeight = octree.surfaceBaseHeight,
+            surfaceNoiseAmplitude = octree.surfaceNoiseAmplitude,
+            chunkResolution = octree.chunkResolution,
+            nodeScale = NodeScale(),
+            worldNodePosition = nodePos,
+            modKeys = modKeys,
+            modValues = modValues,
+        };
+
+        // Mark as in-flight so we don't double-collect this frame
+        isScheduled = true;
+        needsDrawn = false;
+
+        var capturedFilter = meshFilter;
+        var capturedCollider = meshCollider;
+
+        jobCompleter = new JobCompleter(
+            // schedule — start the Burst job
+            schedule: () => job.Schedule(),
+
+            // onComplete — apply finished mesh (main thread, after CompleteAll)
+            onComplete: () =>
+            {
+                var mesh = new Mesh { name = "node_mesh", bounds = bounds };
+                Mesh.ApplyAndDisposeWritableMeshData(meshDataArray, mesh);
+                mesh.RecalculateNormals();
+                capturedFilter.mesh = mesh;
+                capturedCollider.sharedMesh = mesh;
+                isScheduled = false;
+                if (modKeys.IsCreated) modKeys.Dispose();
+                if (modValues.IsCreated) modValues.Dispose();
+            },
+
+            // cancel — budget dropped this job; free resources and reset so
+            //          the node is re-collected on the next frame
+            cancel: () =>
+            {
+                meshDataArray.Dispose();
+                if (modKeys.IsCreated) modKeys.Dispose();
+                if (modValues.IsCreated) modValues.Dispose();
+                isScheduled = false;
+                needsDrawn = true;   // will be re-collected next frame
+            }
+        );
+
+        return true;
     }
 
     // -----------------------------------------------------------------------
@@ -149,7 +155,6 @@ public class Node
         out NativeArray<int3> keys, out NativeArray<byte> values)
     {
         var wm = WorldModifications.Instance;
-
         if (wm == null)
         {
             keys = new NativeArray<int3>(0, Allocator.Persistent);
@@ -162,7 +167,6 @@ public class Node
 
         keys = new NativeArray<int3>(kArr.Length, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
         values = new NativeArray<byte>(vArr.Length, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
-
         for (int i = 0; i < kArr.Length; i++)
         {
             keys[i] = new int3(kArr[i].x, kArr[i].y, kArr[i].z);

@@ -1,4 +1,3 @@
-using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
 using Unity.Collections;
@@ -6,272 +5,273 @@ using Unity.Jobs;
 using System.Diagnostics;
 using Unity.Mathematics;
 
+/// <summary>
+/// Flat toroidal voxel world with floating-origin streaming and block modifications.
+///
+/// The octree root re-anchors to the nearest grid cell each frame so terrain
+/// always exists around the player.  Noise is sampled with wrapped coordinates
+/// so terrain repeats seamlessly every (worldSizeX, worldSizeZ) units.
+/// </summary>
 public class Octree : MonoBehaviour
 {
-    [Space]
+    [Header("World Size  (terrain repeats every N units)")]
+    public float worldSizeX = 4096f;
+    public float worldSizeZ = 4096f;
+
+    [Header("Terrain Shape")]
+    public float surfaceBaseHeight = 0f;
+    public float surfaceNoiseAmplitude = 64f;
+
+    [Header("Octree")]
     public int maxNodeCreationsPerFrame = 50;
-
-    [Space]
-    public float planetRadius = 6000f;
-
-    [Space]
     public int chunkResolution = 16;
+    public float innerRadiusPadding = 2f;
+    public int divisions = 11;
 
-    [Space]
+    [Header("References")]
     public Transform priority;
     public GameObject chunkPrefab;
 
-    [Space]
-    public float innerRadiusPadding = 2;
-    public int divisions = 11;
+    // -----------------------------------------------------------------------
+    [HideInInspector] public Node root;
 
-    [HideInInspector]
-    public Node root;
     private int nodeResolution;
     private float nodeScale;
     private double worldVoxelsCount;
-    private List<JobCompleter> toComplete = new List<JobCompleter>();
+    private readonly List<JobCompleter> toComplete = new List<JobCompleter>();
+    private Vector3 currentTreeOrigin = new Vector3(float.MaxValue, 0, float.MaxValue);
+
+    // -----------------------------------------------------------------------
+    //  Lifecycle
+    // -----------------------------------------------------------------------
 
     private void Start()
     {
-        nodeResolution = (int)Mathf.Pow(2, (divisions - 1));
+        nodeResolution = (int)Mathf.Pow(2, divisions - 1);
         nodeScale = chunkResolution * nodeResolution;
 
-        Vector3 offset = Vector3.up;
-        Vector3 pos = (offset * nodeScale) - (Vector3.one * (nodeScale / 2));
-        root = new Node(this, null, pos, divisions);
+        worldVoxelsCount = System.Math.Pow(nodeResolution, 3)
+                         * System.Math.Pow(chunkResolution, 3);
 
-        UnityEngine.Debug.Log("nodeResolution: " + nodeResolution);
-        UnityEngine.Debug.Log("nodeScale: " + nodeResolution);
+        // Give WorldModifications the world dimensions so it can wrap keys correctly
+        if (WorldModifications.Instance != null)
+        {
+            WorldModifications.Instance.worldSizeX = worldSizeX;
+            WorldModifications.Instance.worldSizeZ = worldSizeZ;
+        }
 
-        worldVoxelsCount = (double)((double)Mathf.Pow(nodeResolution, 3) * (double)Mathf.Pow(chunkResolution, 3));
-        UnityEngine.Debug.Log("world voxels count: " + worldVoxelsCount);
+        UnityEngine.Debug.Log(
+            $"[Octree] nodeResolution={nodeResolution}  nodeScale={nodeScale}\n" +
+            $"[Octree] Terrain repeats every {worldSizeX} x {worldSizeZ} units");
+
+        RebuildTree();
     }
 
     private void Update()
     {
+        Vector3 desired = SnapToGrid(priority.position);
+        if (Vector3.Distance(desired, currentTreeOrigin) > nodeScale * 0.1f)
+            RebuildTree();
+
         Traverse(root, 0);
         Schedule(root);
     }
 
     private void LateUpdate()
     {
-        if (toComplete.Count > 0)
-        {
-            var w = new Stopwatch();
-            w.Start();
-            NativeArray<JobHandle> jobHandles = new NativeArray<JobHandle>(toComplete.Count, Allocator.Temp);
-            for (int i = 0; i < toComplete.Count; i++)
-            {
-                jobHandles[i] = toComplete[i].schedule();
-            }
-            JobHandle.CompleteAll(jobHandles);
-            jobHandles.Dispose();
+        if (toComplete.Count == 0) return;
 
-            for (int i = 0; i < toComplete.Count; i++)
-            {
-                toComplete[i].onComplete();
-            }
+        var sw = new Stopwatch();
+        sw.Start();
 
-            toComplete.Clear();
-            w.Stop();
-            UnityEngine.Debug.Log("meshing took " + w.ElapsedMilliseconds);
-        }
-    }
+        var handles = new NativeArray<JobHandle>(toComplete.Count, Allocator.Temp);
+        for (int i = 0; i < toComplete.Count; i++)
+            handles[i] = toComplete[i].schedule();
+        JobHandle.CompleteAll(handles);
+        handles.Dispose();
 
-    private void OnDrawGizmos()
-    {
-        if (root != null)
-        {
-            DrawNodeGizmos(root);
-            DrawDebugRadiuses();
-        }
+        for (int i = 0; i < toComplete.Count; i++)
+            toComplete[i].onComplete();
+
+        toComplete.Clear();
+        sw.Stop();
+        UnityEngine.Debug.Log($"[Octree] meshing {sw.ElapsedMilliseconds} ms");
     }
 
     private void OnDisable()
     {
-        Dispose(root);
+        if (root != null) DestroyTree(root);
     }
 
     private void OnGUI()
     {
-        GUILayout.Label("World Voxels Count: " + worldVoxelsCount);
+        GUILayout.Label($"World repeats every: {worldSizeX} x {worldSizeZ}  (toroidal)");
+        if (priority != null)
+            GUILayout.Label($"Player pos: {priority.position}");
+        if (WorldModifications.Instance != null)
+            GUILayout.Label($"Modifications: {WorldModifications.Instance.Count}");
     }
+
+    private void OnDrawGizmos()
+    {
+        if (root == null) return;
+        DrawNodeGizmos(root);
+        DrawLODRings(divisions);
+    }
+
+    // -----------------------------------------------------------------------
+    //  Tree rebuild
+    // -----------------------------------------------------------------------
+
+    private void RebuildTree()
+    {
+        if (root != null) DestroyTree(root);
+        currentTreeOrigin = SnapToGrid(priority.position);
+        root = new Node(this, null, currentTreeOrigin, divisions);
+    }
+
+    private Vector3 SnapToGrid(Vector3 pos)
+    {
+        float snap = nodeScale;
+        return new Vector3(
+            Mathf.Round(pos.x / snap) * snap,
+            surfaceBaseHeight,
+            Mathf.Round(pos.z / snap) * snap
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    //  Traversal
+    // -----------------------------------------------------------------------
 
     public void Traverse(Node node, int creations)
     {
-        if (creations > maxNodeCreationsPerFrame)
-        {
-            return;
-        }
+        if (creations > maxNodeCreationsPerFrame) return;
 
-        // if we created new nodes
-        bool createdNewNodes = false;
-
-        // if we are not a deepest leaf node node
         if (node.divisions > 1)
         {
-            // if distance is inside of allowed distance
             if (ShouldSubdivide(node))
             {
-                // this is no longer a leaf node we need to clear it
                 node.Clear();
-
-                // only create children if they don't already exist
                 if (node.children == null)
                 {
-                    // we are creating new nodes
-                    createdNewNodes = true;
-
                     node.children = new Node[8];
                     for (int i = 0; i < 8; i++)
-                    {
                         node.children[i] = new Node(this, node, Tables.Offsets[i], node.divisions - 1);
-                    }
+                    creations++;
                 }
             }
-
-            // (outside of radius) we should not have children
-            // no children means: IsLeaf == true
             else
             {
-                // delete children
                 DeleteChildren(node);
             }
 
-            if (createdNewNodes)
-            {
-                creations += 1;
-            }
-
-            // if have NOT deleted the children
-            // recurse
             if (node.children != null)
-            {
                 for (int i = 0; i < 8; i++)
-                {
                     Traverse(node.children[i], creations);
-                }
-            }
         }
     }
 
     private bool ShouldSubdivide(Node node)
     {
-        float3 center = node.NodePosition();
-        float3 scale = node.NodeScale() * innerRadiusPadding + 1;
+        Vector3 center = node.NodePosition();
+        float halfSize = node.NodeScale() * innerRadiusPadding + 1f;
+        Vector3 min = center - Vector3.one * halfSize;
+        Vector3 max = center + Vector3.one * halfSize;
+        Vector3 pp = priority.position;
 
-        // Berechnen der Grenzen des Knotens
-        Vector3 minBound = center - scale;
-        Vector3 maxBound = center + scale;
-
-        // Überprüfen, ob sich der Spieler innerhalb dieser Grenzen befindet
-        bool insideX = priority.position.x >= minBound.x && priority.position.x <= maxBound.x;
-        bool insideY = priority.position.y >= minBound.y && priority.position.y <= maxBound.y;
-        bool insideZ = priority.position.z >= minBound.z && priority.position.z <= maxBound.z;
-
-        return insideX && insideY && insideZ;
+        return pp.x >= min.x && pp.x <= max.x
+            && pp.y >= min.y && pp.y <= max.y
+            && pp.z >= min.z && pp.z <= max.z;
     }
+
+    // -----------------------------------------------------------------------
+    //  FindLeafAt  (used by BlockInteraction)
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// Returns the leaf node whose AABB contains <paramref name="worldPos"/>,
+    /// or null if no such node exists in the current tree.
+    /// </summary>
+    public Node FindLeafAt(Vector3 worldPos)
+    {
+        if (root == null) return null;
+        return FindLeafAt(root, worldPos);
+    }
+
+    private Node FindLeafAt(Node node, Vector3 worldPos)
+    {
+        // Check if worldPos is inside this node's AABB
+        Vector3 center = node.NodePosition();
+        float half = node.NodeScale() * 0.5f;
+
+        if (worldPos.x < center.x - half || worldPos.x > center.x + half) return null;
+        if (worldPos.y < center.y - half || worldPos.y > center.y + half) return null;
+        if (worldPos.z < center.z - half || worldPos.z > center.z + half) return null;
+
+        if (node.IsLeaf()) return node;
+
+        foreach (var child in node.children)
+        {
+            Node result = FindLeafAt(child, worldPos);
+            if (result != null) return result;
+        }
+
+        return null;
+    }
+
+    // -----------------------------------------------------------------------
+    //  Scheduling
+    // -----------------------------------------------------------------------
 
     public void Schedule(Node node)
     {
-        if (node.TrySchedule(out JobCompleter completer))
-        {
-            toComplete.Add(completer);
-        }
-
-        if (node.children == null)
-        {
-            return;
-        }
-
-        // recurse
+        if (node.TrySchedule(out JobCompleter c)) toComplete.Add(c);
+        if (node.children == null) return;
         for (int i = 0; i < node.children.Length; i++)
-        {
             Schedule(node.children[i]);
-        }
     }
 
-    public void Dispose(Node node)
-    {
-        // prevent from infinite recursion
-        if (node.children == null)
-        {
-            return;
-        }
+    // -----------------------------------------------------------------------
+    //  Cleanup
+    // -----------------------------------------------------------------------
 
-        // do deletion
-        for (int i = 0; i < node.children.Length; i++)
-        {
-            // dispose of gameObject and mesh arrays
-            node.children[i].Destroy();
-        }
-        node.children = null;
+    private void DestroyTree(Node node)
+    {
+        if (node == null) return;
+        if (node.children != null)
+            foreach (var c in node.children) DestroyTree(c);
+        node.Destroy();
     }
 
     public void DeleteChildren(Node node)
     {
-        // prevent from infinite recursion
-        if (node.children == null)
-        {
-            return;
-        }
-
-        // recurse
-        for (int i = 0; i < node.children.Length; i++)
-        {
-            DeleteChildren(node.children[i]);
-        }
-
-        // do deletion
-        for (int i = 0; i < node.children.Length; i++)
-        {
-            // dispose of gameObject and mesh arrays
-            node.children[i].Destroy();
-        }
+        if (node.children == null) return;
+        foreach (var c in node.children) DeleteChildren(c);
+        foreach (var c in node.children) c.Destroy();
         node.children = null;
     }
 
-    public void DrawNodeGizmos(Node node)
+    // -----------------------------------------------------------------------
+    //  Gizmos
+    // -----------------------------------------------------------------------
+
+    private void DrawNodeGizmos(Node node)
     {
         Gizmos.color = Color.red;
         Gizmos.DrawWireCube(node.NodePosition(), Vector3.one * node.NodeScale());
-        Gizmos.DrawSphere(node.NodePosition(), 0.5f);
-
-        // if children exist
         if (node.children != null)
-        {
-            for (int i = 0; i < 8; i++)
-            {
-                DrawNodeGizmos(node.children[i]);
-            }
-        }
+            foreach (var c in node.children) DrawNodeGizmos(c);
     }
 
-    public void DrawDebugRadiuses()
+    private void DrawLODRings(int div)
     {
-        DrawRadiuses(divisions);
-    }
-
-    private void DrawRadiuses(int divisions)
-    {
-        float nodeResolution = (int)Mathf.Pow(2, (divisions - 1));
-        float nodeScale = this.chunkResolution * nodeResolution;
-
-        float3 scale = nodeScale * innerRadiusPadding * 2;
-
-        // leaf node
-        if (divisions < 2)
-        {
-            Gizmos.color = Color.grey;
-            Gizmos.DrawWireCube(this.priority.position, scale);
-        }
-        else
-        {
-            Gizmos.color = Color.green;
-            Gizmos.DrawWireCube(this.priority.position, scale);
-
-            DrawRadiuses(divisions - 1);
-        }
+        if (priority == null) return;
+        float nr = Mathf.Pow(2, div - 1);
+        float ns = chunkResolution * nr;
+        float range = ns * innerRadiusPadding * 2f;
+        Gizmos.color = div < 2 ? Color.grey : Color.green;
+        Gizmos.DrawWireCube(priority.position, Vector3.one * range);
+        if (div >= 2) DrawLODRings(div - 1);
     }
 }

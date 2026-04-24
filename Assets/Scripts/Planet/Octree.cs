@@ -22,6 +22,14 @@ public class Octree : MonoBehaviour
     /// </summary>
     [HideInInspector] public float[] lodRadii;
 
+    /// <summary>
+    /// Frustum planes updated every frame by OctreeGrid before calling Tick.
+    /// CollectJobs uses these to skip mesh generation for nodes fully outside
+    /// the camera frustum. Traverse is NOT affected — the tree structure must
+    /// stay correct for all directions so nodes are ready when the player turns.
+    /// </summary>
+    [HideInInspector] public Plane[] frustumPlanes;
+
     [HideInInspector] public Node root;
 
     private bool initialised = false;
@@ -40,9 +48,10 @@ public class Octree : MonoBehaviour
         initialised = true;
     }
 
-    public void Tick(List<OctreeGrid.PrioritizedJob> jobList, Vector3 playerPos)
+    public void Tick(List<OctreeGrid.PrioritizedJob> jobList, Vector3 playerPos, Plane[] planes)
     {
         if (!initialised) return;
+        frustumPlanes = planes;
         int creations = 0;
         Traverse(root, playerPos, ref creations);
         CollectJobs(root, jobList, playerPos);
@@ -152,6 +161,12 @@ public class Octree : MonoBehaviour
 
     private void CollectJobs(Node node, List<OctreeGrid.PrioritizedJob> jobList, Vector3 playerPos)
     {
+        // Cull entire subtree when its AABB is completely outside the frustum.
+        // TestPlanesAABB returns false when all 6 planes reject the box.
+        // We use a slightly expanded bounds so nodes right at the edge of the
+        // frustum (whose faces are still partially visible) are never skipped.
+        if (frustumPlanes != null && !IsAabbInFrustum(node)) return;
+
         if (node.TryCollectJob(out JobCompleter completer))
         {
             jobList.Add(new OctreeGrid.PrioritizedJob
@@ -164,6 +179,23 @@ public class Octree : MonoBehaviour
         if (node.children == null) return;
         for (int i = 0; i < node.children.Length; i++)
             CollectJobs(node.children[i], jobList, playerPos);
+    }
+
+    /// <summary>
+    /// Returns true if the node's world-space AABB intersects or is inside
+    /// the camera frustum. Returns false only when the box is fully outside
+    /// at least one frustum plane — meaning nothing in the subtree is visible.
+    ///
+    /// We expand the test radius by 10% so nodes whose geometry slightly
+    /// extends past the calculated AABB (due to voxel rounding) are never
+    /// incorrectly culled at the screen edge.
+    /// </summary>
+    private bool IsAabbInFrustum(Node node)
+    {
+        Vector3 center = node.NodePosition();
+        float half = node.NodeScale() * 0.5f * 1.1f; // 10% expansion
+        var bounds = new Bounds(center, Vector3.one * (half * 2f));
+        return GeometryUtility.TestPlanesAABB(frustumPlanes, bounds);
     }
 
     // -----------------------------------------------------------------------

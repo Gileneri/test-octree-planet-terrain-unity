@@ -85,6 +85,7 @@ public class OctreeGrid : MonoBehaviour
 
     [Header("References")]
     public Transform priority;
+    public Camera playerCamera;   // used for frustum culling — assign the player camera
     public GameObject chunkPrefab;
 
     // -----------------------------------------------------------------------
@@ -104,6 +105,9 @@ public class OctreeGrid : MonoBehaviour
 
     // Baked LOD radii shared across all octrees
     private float[] lodRadii;
+
+    // Frustum planes extracted once per frame and shared with all octrees
+    private Plane[] frustumPlanes;
 
     // -----------------------------------------------------------------------
 
@@ -163,8 +167,14 @@ public class OctreeGrid : MonoBehaviour
 
         ProcessPendingCells(newCellsPerFrame);
 
+        // Extract frustum planes once per frame for all octrees to share.
+        // If no camera is assigned, frustum culling is skipped (planes = null).
+        frustumPlanes = playerCamera != null
+            ? GeometryUtility.CalculateFrustumPlanes(playerCamera)
+            : null;
+
         foreach (var octree in activeCells.Values)
-            octree.Tick(frameJobs, priority.position);
+            octree.Tick(frameJobs, priority.position, frustumPlanes);
     }
 
     private void LateUpdate()
@@ -208,7 +218,7 @@ public class OctreeGrid : MonoBehaviour
     private void OnGUI()
     {
         GUILayout.Label($"World: {worldSizeX} × {worldSizeZ} units  (toroidal)");
-        GUILayout.Label($"Active cells: {activeCells.Count}  Pending: {pendingCells.Count}");
+        GUILayout.Label($"Active cells: {activeCells.Count}  Pending: {pendingCells.Count}  Jobs: {frameJobs.Count}");
         GUILayout.Label($"Player: {priority.position}");
         GUILayout.Label($"Speed: {playerVelocity.magnitude:F1} u/s  " +
                         $"Prediction: {(playerVelocity.magnitude > predictionSpeedThreshold ? "ON" : "off")}");

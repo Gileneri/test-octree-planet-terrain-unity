@@ -579,6 +579,9 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: 
   camera: {fileID: 963194228}
+  normalSpeed: 20
+  fastSpeed: 200
+  mouseSensitivity: 2
 --- !u!114 &1518825927
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -630,29 +633,38 @@ MonoBehaviour:
   worldSizeZ: 50000
   surfaceBaseHeight: 0
   surfaceNoiseAmplitude: 64
-  divisions: 8
-  chunkResolution: 16
+  divisions: 6
+  chunkResolution: 32
   lodDistanceCurve:
     serializedVersion: 2
     m_Curve:
     - serializedVersion: 3
-      time: 0.9999887
-      value: 3.0093212
-      inSlope: 10.034078
-      outSlope: 10.034078
-      tangentMode: 34
+      time: 0
+      value: 2
+      inSlope: 0
+      outSlope: 0
+      tangentMode: 3
+      weightedMode: 0
+      inWeight: 0
+      outWeight: 0.33333334
+    - serializedVersion: 3
+      time: 0.55
+      value: 2
+      inSlope: 3.3333335
+      outSlope: 3.3333335
+      tangentMode: 3
       weightedMode: 0
       inWeight: 0.33333334
       outWeight: 0.33333334
     - serializedVersion: 3
-      time: 1.1983845
-      value: 5.0000405
-      inSlope: 10.034078
-      outSlope: 10.034078
-      tangentMode: 34
+      time: 1
+      value: 5
+      inSlope: 6.666667
+      outSlope: 6.666667
+      tangentMode: 3
       weightedMode: 0
       inWeight: 0.33333334
-      outWeight: 0.33333334
+      outWeight: 0
     m_PreInfinity: 2
     m_PostInfinity: 2
     m_RotationOrder: 4

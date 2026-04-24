@@ -56,6 +56,23 @@ public class Octree : MonoBehaviour
         Destroy(gameObject);
     }
 
+    /// <summary>
+    /// Destroys and recreates the entire octree from the root.
+    /// Called by OctreeGrid.RebakeLodRadii so LOD changes are visible immediately.
+    /// </summary>
+    public void ForceRebuildTree()
+    {
+        if (root != null) DestroyTree(root);
+
+        int nodeResolution = (int)UnityEngine.Mathf.Pow(2, divisions - 1);
+        float nodeScale = chunkResolution * nodeResolution;
+        Vector3 rootOffset = cellOrigin + new Vector3(nodeScale, nodeScale, nodeScale) * 0.5f;
+        rootOffset.y = surfaceBaseHeight;
+
+        root = new Node(this, null, rootOffset, divisions);
+        // initialised stays true — Tick() will traverse and mesh immediately
+    }
+
     // -----------------------------------------------------------------------
     //  Traversal
     // -----------------------------------------------------------------------

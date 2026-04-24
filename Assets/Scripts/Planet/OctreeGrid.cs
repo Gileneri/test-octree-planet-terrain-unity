@@ -241,6 +241,21 @@ public class OctreeGrid : MonoBehaviour
     /// Level 0 = finest (divisions == 1, node size = chunkResolution voxels)
     /// Level divisions-1 = coarsest (root, node size = cellSize)
     /// </summary>
+    /// <summary>
+    /// Called by OctreeGridEditor Rebake and Apply button at runtime.
+    /// Recalculates LOD radii from the curve, propagates to all active octrees,
+    /// and forces each one to rebuild its tree so the change is visible immediately.
+    /// </summary>
+    public void RebakeLodRadii()
+    {
+        BakeLodRadii();
+        foreach (var oct in activeCells.Values)
+        {
+            oct.lodRadii = lodRadii;
+            oct.ForceRebuildTree();
+        }
+    }
+
     private void BakeLodRadii()
     {
         lodRadii = new float[divisions];

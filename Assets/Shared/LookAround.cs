@@ -1,45 +1,45 @@
-using System.Collections;
-using System.Collections.Generic;
-using UnityEngine;
+﻿using UnityEngine;
 
 public class LookAround : MonoBehaviour
 {
     public new Transform camera;
 
-    private float speed = 1f;
-    private float anglePerSecond = 1f;
+    [Header("Movement")]
+    [Tooltip("Normal movement speed (units per second).")]
+    public float normalSpeed = 20f;
+
+    [Tooltip("Fast movement speed when holding Fire3 (Left Shift).")]
+    public float fastSpeed = 200f;
+
+    [Tooltip("Mouse look sensitivity (degrees per tick).")]
+    public float mouseSensitivity = 2f;
 
     private void Start()
     {
         Cursor.lockState = CursorLockMode.Locked;
     }
 
-    public void Update()
+    private void Update()
     {
+        // ── Movement ─────────────────────────────────────────────────────
         float forward = Input.GetAxis("Vertical");
         float right = Input.GetAxis("Horizontal");
         float up = Input.GetAxis("UpDown");
 
-        if (Input.GetButton("Fire3"))
-        {
-            speed = 20;
-        }
-        else
-        {
-            speed = 1;
-        }
+        float speed = Input.GetButton("Fire3") ? fastSpeed : normalSpeed;
 
-        transform.position += camera.forward * forward * speed;
-        transform.position += transform.up * up * speed;
-        transform.position += transform.right * right * speed;
+        // Multiply by Time.deltaTime so speed is frame-rate independent.
+        // Previously the movement was per-frame, so a meshing spike would
+        // cause the player to move slower during heavy LOD transitions.
+        transform.position += camera.forward * forward * speed * Time.deltaTime;
+        transform.position += transform.up * up * speed * Time.deltaTime;
+        transform.position += transform.right * right * speed * Time.deltaTime;
 
-        float rotateY = Input.GetAxis("Mouse X") != 0f ? Mathf.Sign(Input.GetAxis("Mouse X")) : 0f;
-        float rotateX = Input.GetAxis("Mouse Y") != 0f ? Mathf.Sign(Input.GetAxis("Mouse Y")) : 0f;
+        // ── Look ──────────────────────────────────────────────────────────
+        float rotateY = Input.GetAxis("Mouse X");
+        float rotateX = Input.GetAxis("Mouse Y");
 
-        // we look side to side
-        transform.Rotate(new Vector3(0, rotateY * anglePerSecond));
-
-        // camera looks up and down
-        camera.Rotate(new Vector3(-rotateX * anglePerSecond, 0));
+        transform.Rotate(Vector3.up, rotateY * mouseSensitivity, Space.World);
+        camera.Rotate(Vector3.right, -rotateX * mouseSensitivity);
     }
 }

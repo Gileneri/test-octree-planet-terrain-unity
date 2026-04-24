@@ -636,28 +636,28 @@ MonoBehaviour:
     serializedVersion: 2
     m_Curve:
     - serializedVersion: 3
-      time: 1.4835968
-      value: 4.9958496
-      inSlope: 1.6629064
-      outSlope: 1.6629064
-      tangentMode: 34
-      weightedMode: 0
-      inWeight: 0
-      outWeight: 0.33333334
-    - serializedVersion: 3
-      time: 3.3247323
-      value: 8.057486
-      inSlope: 1.6629064
-      outSlope: 1.6629064
+      time: 0.9999887
+      value: 3.0093212
+      inSlope: 10.034078
+      outSlope: 10.034078
       tangentMode: 34
       weightedMode: 0
       inWeight: 0.33333334
-      outWeight: 0
+      outWeight: 0.33333334
+    - serializedVersion: 3
+      time: 1.1983845
+      value: 5.0000405
+      inSlope: 10.034078
+      outSlope: 10.034078
+      tangentMode: 34
+      weightedMode: 0
+      inWeight: 0.33333334
+      outWeight: 0.33333334
     m_PreInfinity: 2
     m_PostInfinity: 2
     m_RotationOrder: 4
-  renderRadius: 10
-  maxJobsPerFrame: 120
+  renderRadius: 7
+  maxJobsPerFrame: 1000
   newCellsPerFrame: 3
   maxNodeCreationsPerFrame: 50
   predictionDistance: 3

@@ -610,7 +610,7 @@ MonoBehaviour:
     m_PreInfinity: 2
     m_PostInfinity: 2
     m_RotationOrder: 4
-  renderRadius: 4
+  renderRadius: 10
   maxJobsPerFrame: 160
   newCellsPerFrame: 3
   maxNodeCreationsPerFrame: 50

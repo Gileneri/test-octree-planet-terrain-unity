@@ -1,0 +1,13 @@
+{
+  "name": "Earths_Moon",
+  "noiseType": "OpenSimplex2",
+  "seed": 2376,
+  "worldSizeX": 50000.0,
+  "worldSizeZ": 50000.0,
+  "surfaceBaseHeight": 0.0,
+  "surfaceNoiseAmplitude": 300.0,
+  "minSubsurfaceHeight": -500.0,
+  "divisions": 7,
+  "chunkResolution": 8,
+  "renderRadius": 6
+}

@@ -44,6 +44,21 @@ public class OctreeGrid : MonoBehaviour
     [Tooltip("Max terrain height. Scale up for larger worlds (300+ for 50 km).")]
     public float surfaceNoiseAmplitude = 300f;
 
+    // ── WorldConfig-driven fields (added) ────────────────────────────────
+    [Header("Noise")]
+    [Tooltip("FastNoiseLite seed. Populated by WorldConfigLoader from the world JSON.")]
+    public int noiseSeed = 2376;
+
+    [Tooltip("FastNoiseLite noise type as an integer id.\n" +
+             "0=OpenSimplex2  1=OpenSimplex2S  2=Perlin\n" +
+             "Populated by WorldConfigLoader — do not edit by hand.")]
+    public int noiseTypeId = 0;
+
+    [Tooltip("Hard floor Y. Voxels below this are always solid. " +
+             "Populated by WorldConfigLoader from the world JSON.")]
+    public float minSubsurfaceHeight = -500f;
+    // ─────────────────────────────────────────────────────────────────────
+
     [Header("Octree per cell")]
     [Tooltip("Octree depth. 7 with chunkResolution=8 gives ~1024 unit cells.")]
     public int divisions = 7;
@@ -136,7 +151,9 @@ public class OctreeGrid : MonoBehaviour
 
         Debug.Log($"[OctreeGrid] cellSize={cellSize}  renderRadius={renderRadius}  " +
                   $"grid={(renderRadius * 2 + 1)}×{(renderRadius * 2 + 1)}  " +
-                  $"world={worldSizeX}×{worldSizeZ}");
+                  $"world={worldSizeX}×{worldSizeZ}  " +
+                  $"seed={noiseSeed}  noiseTypeId={noiseTypeId}  " +
+                  $"minSubY={minSubsurfaceHeight}");
 
         prevPlayerPos = priority.position;
 
@@ -204,10 +221,10 @@ public class OctreeGrid : MonoBehaviour
 
         sw.Stop();
         if (sw.ElapsedMilliseconds > 5)
-            Debug.Log($"[OctreeGrid] meshing {sw.ElapsedMilliseconds} ms  ({count} jobs)");
+            Debug.Log($"[OctreeGrid] meshing {sw.ElapsedMilliseconds} ms  jobs={count}");
     }
 
-    private void OnDisable()
+    private void OnDestroy()
     {
         foreach (var octree in activeCells.Values)
             octree.Shutdown();
@@ -380,6 +397,11 @@ public class OctreeGrid : MonoBehaviour
         octree.worldSizeZ = worldSizeZ;
         octree.surfaceBaseHeight = surfaceBaseHeight;
         octree.surfaceNoiseAmplitude = surfaceNoiseAmplitude;
+        // ── WorldConfig-driven fields (added) ──────────────────────────────
+        octree.noiseSeed = noiseSeed;
+        octree.noiseTypeId = noiseTypeId;
+        octree.minSubsurfaceHeight = minSubsurfaceHeight;
+        // ───────────────────────────────────────────────────────────────────
         octree.divisions = divisions;
         octree.chunkResolution = chunkResolution;
         octree.maxNodeCreationsPerFrame = maxNodeCreationsPerFrame;

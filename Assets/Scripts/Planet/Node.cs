@@ -103,6 +103,11 @@ public class Node
             worldSizeZ = octree.worldSizeZ,
             surfaceBaseHeight = octree.surfaceBaseHeight,
             surfaceNoiseAmplitude = octree.surfaceNoiseAmplitude,
+            // ── WorldConfig-driven fields (added) ──────────────────────────
+            noiseSeed = octree.noiseSeed,
+            noiseTypeId = octree.noiseTypeId,
+            minSubsurfaceHeight = octree.minSubsurfaceHeight,
+            // ───────────────────────────────────────────────────────────────
             chunkResolution = octree.chunkResolution,
             nodeScale = NodeScale(),
             worldNodePosition = nodePos,

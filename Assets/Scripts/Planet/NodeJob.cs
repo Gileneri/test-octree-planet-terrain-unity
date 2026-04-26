@@ -16,6 +16,12 @@ using Unity.Burst;
 /// SEAMLESS WRAP:
 ///   XZ positions are wrapped via PosMod before noise sampling using the
 ///   4-D toroidal embedding (cos/sin) so the terrain tiles with no seam.
+///
+/// WORLD CONFIG INTEGRATION (added):
+///   noiseSeed, noiseTypeId and minSubsurfaceHeight are now job fields
+///   filled by Node.TryCollectJob from Octree, which receives them from
+///   OctreeGrid, which receives them from WorldConfigLoader.
+///   No hard-coded values remain for these settings.
 /// </summary>
 [BurstCompile]
 public struct NodeJob : IJob
@@ -28,6 +34,29 @@ public struct NodeJob : IJob
     public float surfaceBaseHeight;
     public float surfaceNoiseAmplitude;
 
+    // ── WorldConfig-driven fields (were hard-coded before) ────────────────
+    /// <summary>
+    /// FastNoiseLite seed. Maps directly to noise.SetSeed().
+    /// </summary>
+    public int noiseSeed;
+
+    /// <summary>
+    /// Noise type as an integer so Burst can handle it without managed enums.
+    /// Use NodeJob.NoiseTypeToId() on the main thread to convert the string
+    /// from WorldConfig (e.g. "OpenSimplex2") to the right integer.
+    /// 0=OpenSimplex2 (default), 1=OpenSimplex2S, 2=Cellular,
+    /// 3=Perlin, 4=ValueCubic, 5=Value.
+    /// </summary>
+    public int noiseTypeId;
+
+    /// <summary>
+    /// Hard floor for solid terrain.  Any voxel whose world-Y is below this
+    /// value is always solid, regardless of the noise surface.
+    /// Set to a very negative number (e.g. -9999) to disable.
+    /// </summary>
+    public float minSubsurfaceHeight;
+    // ─────────────────────────────────────────────────────────────────────
+
     public int chunkResolution;
     public float nodeScale;
     public float3 worldNodePosition;
@@ -39,6 +68,29 @@ public struct NodeJob : IJob
 
     private float3 centerOffset;
     private float normalizedVoxelScale;
+
+    // -----------------------------------------------------------------------
+    //  Noise type id helper  (call on main thread — not inside Burst)
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// Converts the noiseType string from WorldConfig to the integer id that
+    /// NodeJob.noiseTypeId expects.  Falls back to 0 (OpenSimplex2) for
+    /// unrecognised values.
+    /// Available in this FastNoiseLite build:
+    ///   0 = OpenSimplex2 (default)
+    ///   1 = OpenSimplex2S
+    ///   2 = Perlin
+    /// </summary>
+    public static int NoiseTypeToId(string noiseType)
+    {
+        switch (noiseType)
+        {
+            case "OpenSimplex2S": return 1;
+            case "Perlin": return 2;
+            default: return 0; // OpenSimplex2
+        }
+    }
 
     // -----------------------------------------------------------------------
     public void Execute()
@@ -55,9 +107,18 @@ public struct NodeJob : IJob
         normalizedVoxelScale = nodeScale / chunkResolution;
 
         var noise = new FastNoiseLite();
-        noise.SetNoiseType(FastNoiseLite.NoiseType.OpenSimplex2);
+        noise.SetSeed(noiseSeed);
         noise.SetFrequency(0.003f);
-        noise.SetSeed(2376);
+
+        // Apply noise type from the id field.
+        // Only types enabled in this FastNoiseLite build:
+        // 0=OpenSimplex2, 1=OpenSimplex2S, 2=Perlin
+        switch (noiseTypeId)
+        {
+            case 1: noise.SetNoiseType(FastNoiseLite.NoiseType.OpenSimplex2S); break;
+            case 2: noise.SetNoiseType(FastNoiseLite.NoiseType.Perlin); break;
+            default: noise.SetNoiseType(FastNoiseLite.NoiseType.OpenSimplex2); break;
+        }
 
         int vi = 0;
         int ii = 0;
@@ -118,6 +179,9 @@ public struct NodeJob : IJob
 
     private bool IsAirWorldPos(float3 wp, ref FastNoiseLite noise)
     {
+        // Hard floor: always solid below minSubsurfaceHeight
+        if (wp.y < minSubsurfaceHeight) return false;
+
         // --- Check modification overrides first ---
         // The key is the wrapped integer voxel coordinate, matching WorldModifications.WrapKey
         int3 key = new int3(

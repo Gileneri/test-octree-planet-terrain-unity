@@ -6,7 +6,7 @@
     "worldSizeZ": 50000.0,
     "surfaceBaseHeight": 0.0,
     "surfaceNoiseAmplitude": 300.0,
-    "minSubsurfaceHeight": -500.0,
+    "minSubsurfaceHeight": -100.0,
     "divisions": 7,
     "chunkResolution": 8,
     "renderRadius": 6

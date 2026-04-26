@@ -51,7 +51,7 @@ public class WorldConfig : ScriptableObject
     // ------------------------------------------------------------------
 
     [Header("Noise")]
-    [Tooltip("FastNoiseLite noise type name. Must match a FastNoiseLite.NoiseType enum value.")]
+    [Tooltip("FastNoiseLite noise type. Available in this build: OpenSimplex2, OpenSimplex2S, Perlin.")]
     public string noiseType = "OpenSimplex2";
 
     public int seed = 2376;
@@ -172,32 +172,32 @@ public class WorldConfig : ScriptableObject
 
     private void ApplyPayload(JsonPayload p)
     {
-        worldName              = p.name;
-        noiseType              = p.noiseType;
-        seed                   = p.seed;
-        worldSizeX             = p.worldSizeX;
-        worldSizeZ             = p.worldSizeZ;
-        surfaceBaseHeight      = p.surfaceBaseHeight;
-        surfaceNoiseAmplitude  = p.surfaceNoiseAmplitude;
-        minSubsurfaceHeight    = p.minSubsurfaceHeight;
-        divisions              = p.divisions;
-        chunkResolution        = p.chunkResolution;
-        renderRadius           = p.renderRadius;
+        worldName = p.name;
+        noiseType = p.noiseType;
+        seed = p.seed;
+        worldSizeX = p.worldSizeX;
+        worldSizeZ = p.worldSizeZ;
+        surfaceBaseHeight = p.surfaceBaseHeight;
+        surfaceNoiseAmplitude = p.surfaceNoiseAmplitude;
+        minSubsurfaceHeight = p.minSubsurfaceHeight;
+        divisions = p.divisions;
+        chunkResolution = p.chunkResolution;
+        renderRadius = p.renderRadius;
     }
 
     private JsonPayload BuildPayload() => new JsonPayload
     {
-        name                  = worldName,
-        noiseType             = noiseType,
-        seed                  = seed,
-        worldSizeX            = worldSizeX,
-        worldSizeZ            = worldSizeZ,
-        surfaceBaseHeight     = surfaceBaseHeight,
+        name = worldName,
+        noiseType = noiseType,
+        seed = seed,
+        worldSizeX = worldSizeX,
+        worldSizeZ = worldSizeZ,
+        surfaceBaseHeight = surfaceBaseHeight,
         surfaceNoiseAmplitude = surfaceNoiseAmplitude,
-        minSubsurfaceHeight   = minSubsurfaceHeight,
-        divisions             = divisions,
-        chunkResolution       = chunkResolution,
-        renderRadius          = renderRadius,
+        minSubsurfaceHeight = minSubsurfaceHeight,
+        divisions = divisions,
+        chunkResolution = chunkResolution,
+        renderRadius = renderRadius,
     };
 
     // Matches the exact key names used by the web editor
@@ -206,14 +206,14 @@ public class WorldConfig : ScriptableObject
     {
         public string name;
         public string noiseType;
-        public int    seed;
-        public float  worldSizeX;
-        public float  worldSizeZ;
-        public float  surfaceBaseHeight;
-        public float  surfaceNoiseAmplitude;
-        public float  minSubsurfaceHeight;
-        public int    divisions;
-        public int    chunkResolution;
-        public int    renderRadius;
+        public int seed;
+        public float worldSizeX;
+        public float worldSizeZ;
+        public float surfaceBaseHeight;
+        public float surfaceNoiseAmplitude;
+        public float minSubsurfaceHeight;
+        public int divisions;
+        public int chunkResolution;
+        public int renderRadius;
     }
 }

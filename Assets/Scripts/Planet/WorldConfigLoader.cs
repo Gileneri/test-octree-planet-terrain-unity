@@ -74,17 +74,22 @@ public class WorldConfigLoader : MonoBehaviour
         if (grid == null) grid = GetComponent<OctreeGrid>();
         if (config == null || grid == null) return;
 
-        grid.worldSizeX            = config.worldSizeX;
-        grid.worldSizeZ            = config.worldSizeZ;
-        grid.surfaceBaseHeight     = config.surfaceBaseHeight;
+        grid.worldSizeX = config.worldSizeX;
+        grid.worldSizeZ = config.worldSizeZ;
+        grid.surfaceBaseHeight = config.surfaceBaseHeight;
         grid.surfaceNoiseAmplitude = config.surfaceNoiseAmplitude;
-        grid.divisions             = config.divisions;
-        grid.chunkResolution       = config.chunkResolution;
-        grid.renderRadius          = config.renderRadius;
+        grid.noiseSeed = config.seed;
+        grid.noiseTypeId = NodeJob.NoiseTypeToId(config.noiseType);
+        grid.minSubsurfaceHeight = config.minSubsurfaceHeight;
+        grid.divisions = config.divisions;
+        grid.chunkResolution = config.chunkResolution;
+        grid.renderRadius = config.renderRadius;
 
         Debug.Log($"[WorldConfigLoader] Applied '{config.worldName}' → OctreeGrid. " +
                   $"World={config.worldSizeX}×{config.worldSizeZ}  " +
                   $"SurfaceBase={config.surfaceBaseHeight}  " +
+                  $"Seed={config.seed}  NoiseType={config.noiseType}(id={grid.noiseTypeId})  " +
+                  $"MinSubY={config.minSubsurfaceHeight}  " +
                   $"Divisions={config.divisions}  ChunkRes={config.chunkResolution}  " +
                   $"RenderRadius={config.renderRadius}");
     }

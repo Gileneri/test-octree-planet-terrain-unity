@@ -14,6 +14,23 @@ public class Octree : MonoBehaviour
     [HideInInspector] public GameObject chunkPrefab;
     [HideInInspector] public Vector3 cellOrigin;
 
+    // ── WorldConfig-driven fields (added) ────────────────────────────────
+    /// <summary>FastNoiseLite seed forwarded to every NodeJob.</summary>
+    [HideInInspector] public int noiseSeed = 2376;
+
+    /// <summary>
+    /// Integer noise type id forwarded to every NodeJob.
+    /// Convert with NodeJob.NoiseTypeToId() before assigning.
+    /// </summary>
+    [HideInInspector] public int noiseTypeId = 0; // 0 = OpenSimplex2
+
+    /// <summary>
+    /// Hard floor Y.  Voxels below this are always solid.
+    /// Forwarded to every NodeJob.
+    /// </summary>
+    [HideInInspector] public float minSubsurfaceHeight = -500f;
+    // ─────────────────────────────────────────────────────────────────────
+
     /// <summary>
     /// Per-level subdivision radii baked by OctreeGrid from lodDistanceCurve.
     /// Index 0 = finest level (divisions==1).

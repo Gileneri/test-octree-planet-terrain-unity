@@ -81,6 +81,11 @@ public struct NodeJob : IJob
     private float3 centerOffset;
     private float normalizedVoxelScale;
 
+    // Pre-computed node AABB Y extents (set at start of Execute)
+    // Used for the two node-level early exits.
+    private float nodeMinY;   // world Y of the node's bottom face
+    private float nodeMaxY;   // world Y of the node's top face
+
     // ═══════════════════════════════════════════════════════════════════════
     //  Main-thread helper
     // ═══════════════════════════════════════════════════════════════════════
@@ -109,8 +114,39 @@ public struct NodeJob : IJob
         var vertices = new NativeArray<float3>(maxVerts, Allocator.Temp, NativeArrayOptions.UninitializedMemory);
         var normals = new NativeArray<float3>(maxVerts, Allocator.Temp, NativeArrayOptions.UninitializedMemory);
 
+        // Zero-length arrays reused by node-level early exits
+        var emptyUint = new NativeArray<uint>(0, Allocator.Temp);
+        var emptyFloat3 = new NativeArray<float3>(0, Allocator.Temp);
+
         centerOffset = new float3(1f, 1f, 1f) * (nodeScale * 0.5f);
         normalizedVoxelScale = nodeScale / chunkResolution;
+
+        // Node world-space Y extents
+        nodeMinY = worldNodePosition.y - nodeScale * 0.5f;
+        nodeMaxY = worldNodePosition.y + nodeScale * 0.5f;
+
+        // ── Node-level early exits ────────────────────────────────────────
+        // These check whether the entire node can be resolved without
+        // iterating a single voxel. Both cases produce an empty mesh.
+
+        // Exit A: node is entirely below the hard floor → all solid, no faces.
+        if (nodeMaxY < minSubsurfaceHeight)
+        {
+            MeshingUtility.ApplyMesh(ref meshDataArray,
+                ref emptyUint, ref emptyFloat3, ref emptyFloat3, ref bounds);
+            return;
+        }
+
+        // Exit B: node is entirely above the maximum possible surface Y.
+        // surfaceBaseHeight + surfaceNoiseAmplitude is the highest the terrain
+        // can ever reach. If the node's bottom is above that, every voxel is Air
+        // → no faces to emit (the mesh is empty).
+        if (nodeMinY > surfaceBaseHeight + surfaceNoiseAmplitude)
+        {
+            MeshingUtility.ApplyMesh(ref meshDataArray,
+                ref emptyUint, ref emptyFloat3, ref emptyFloat3, ref bounds);
+            return;
+        }
 
         // Layer 2 — surface noise
         var surfaceNoise = new FastNoiseLite();
@@ -215,27 +251,50 @@ public struct NodeJob : IJob
         }
 
         // ── Layer 2 : Procedural surface ──────────────────────────────────
-        float wx = PosMod(wp.x, worldSizeX);
-        float wz = PosMod(wp.z, worldSizeZ);
 
-        float aX = wx / worldSizeX * 2f * math.PI;
-        float aZ = wz / worldSizeZ * 2f * math.PI;
-        float R = worldSizeX / (2f * math.PI);
-        float S = worldSizeZ / (2f * math.PI);
+        // Cheap Y early-exit BEFORE the expensive toroidal cos/sin sampling.
+        // If the voxel is above the maximum possible surface height it is
+        // always Air. If it is below the minimum possible surface height it
+        // is always Solid (unless caves or mods override — handled above).
+        float maxSurface = surfaceBaseHeight + surfaceNoiseAmplitude;
+        float minSurface = surfaceBaseHeight - surfaceNoiseAmplitude;
 
-        float cx = math.cos(aX) * R;
-        float sx = math.sin(aX) * R;
-        float cz = math.cos(aZ) * S;
-        float sz = math.sin(aZ) * S;
+        if (wp.y > maxSurface)
+            return true;  // Air — definitely above any terrain
 
-        float n1 = surfaceNoise.GetNoise(cx, sx, cz);
-        float n2 = surfaceNoise.GetNoise(cz + 100f, sz + 100f, cx * 0.5f);
-        float n3 = surfaceNoise.GetNoise(sx * 0.7f, sz * 0.7f + 200f, cz * 0.3f);
+        // Compute actual surface height only when the voxel Y is ambiguous
+        // (could be either side of the real surface).
+        float surfaceY;
+        if (wp.y < minSurface)
+        {
+            // Definitely below the surface — skip noise entirely.
+            surfaceY = maxSurface; // any value > wp.y suffices; use worst-case
+        }
+        else
+        {
+            // Voxel is in the "could go either way" band — must sample noise.
+            float wx = PosMod(wp.x, worldSizeX);
+            float wz = PosMod(wp.z, worldSizeZ);
 
-        float surfaceY = surfaceBaseHeight + (n1 * 0.6f + n2 * 0.3f + n3 * 0.1f) * surfaceNoiseAmplitude;
+            float aX = wx / worldSizeX * 2f * math.PI;
+            float aZ = wz / worldSizeZ * 2f * math.PI;
+            float R = worldSizeX / (2f * math.PI);
+            float S = worldSizeZ / (2f * math.PI);
+
+            float cx = math.cos(aX) * R;
+            float sx = math.sin(aX) * R;
+            float cz = math.cos(aZ) * S;
+            float sz = math.sin(aZ) * S;
+
+            float n1 = surfaceNoise.GetNoise(cx, sx, cz);
+            float n2 = surfaceNoise.GetNoise(cz + 100f, sz + 100f, cx * 0.5f);
+            float n3 = surfaceNoise.GetNoise(sx * 0.7f, sz * 0.7f + 200f, cz * 0.3f);
+
+            surfaceY = surfaceBaseHeight + (n1 * 0.6f + n2 * 0.3f + n3 * 0.1f) * surfaceNoiseAmplitude;
+        }
 
         if (wp.y > surfaceY)
-            return true; // Air — above surface, caves can't carve air
+            return true; // Air — above surface
 
         // ── Layer 3 : Procedural caves ────────────────────────────────────
         if (!cavesEnabled)

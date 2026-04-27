@@ -63,6 +63,22 @@ public class Octree : MonoBehaviour
     /// </summary>
     [HideInInspector] public int maxColliderDivisions = 2;
 
+    // ── LOD vertical bias ─────────────────────────────────────────────────
+    /// <summary>
+    /// How much more "expensive" vertical distance is compared to horizontal
+    /// distance for LOD subdivision decisions.
+    ///
+    /// 1.0 = isotropic (current behaviour — subdivides equally in all directions)
+    /// 2.0 = vertical distance counts 2× → nodes above/below collapse faster
+    /// 3.0 = recommended default — nodes 2 cells below player behave like they
+    ///       are 6 cells away horizontally, avoiding unnecessary underground
+    ///       subdivision when the player is on the surface.
+    ///
+    /// Does NOT affect CollectJobs culling — only subdivision depth.
+    /// Set via OctreeGrid.verticalLodBias and propagated in CreateOctree.
+    /// </summary>
+    [HideInInspector] public float verticalLodBias = 3f;
+
     // ── Underground culling ───────────────────────────────────────────────
     /// <summary>
     /// Player Y position, updated every frame by OctreeGrid.
@@ -175,15 +191,9 @@ public class Octree : MonoBehaviour
     // -----------------------------------------------------------------------
 
     /// <summary>
-    /// Squared distance from the player to the nearest point on the node's AABB.
+    /// Isotropic AABB squared distance — used for job priority sorting and
+    /// frustum/depth culling where physical distance is what matters.
     /// Returns 0 when the player is inside the node.
-    ///
-    /// Why AABB and not center?
-    /// A node 1024 units wide has its center up to ~866 units from a corner.
-    /// If the player stands just inside that corner, center-distance would be
-    /// ~866 units, likely beyond any subdivision radius — so the node never
-    /// subdivides even with the player standing in it. AABB distance is 0 in
-    /// that case, guaranteeing subdivision regardless of node size.
     /// </summary>
     private static float AabbSqrDist(Node node, Vector3 p)
     {
@@ -197,6 +207,32 @@ public class Octree : MonoBehaviour
         return dx * dx + dy * dy + dz * dz;
     }
 
+    /// <summary>
+    /// Bias-weighted AABB squared distance used exclusively for LOD subdivision.
+    ///
+    /// Vertical distance (dy) is multiplied by verticalLodBias before squaring,
+    /// making nodes above/below the player appear "further away" in LOD terms.
+    /// This collapses underground nodes faster without affecting horizontal detail.
+    ///
+    /// Example with bias=3: a node 300u below the player is treated as if it
+    /// were 900u away horizontally — well past most subdivision radii when the
+    /// player is on the surface.
+    ///
+    /// CollectJobs still uses AabbSqrDist (unbiased) for culling and job
+    /// priority, so meshing order and frustum culling are unaffected.
+    /// </summary>
+    private float AabbSqrDistLod(Node node, Vector3 p)
+    {
+        Vector3 c = node.NodePosition();
+        float h = node.NodeScale() * 0.5f;
+
+        float dx = Mathf.Max(0f, Mathf.Abs(p.x - c.x) - h);
+        float dy = Mathf.Max(0f, Mathf.Abs(p.y - c.y) - h) * verticalLodBias;
+        float dz = Mathf.Max(0f, Mathf.Abs(p.z - c.z) - h);
+
+        return dx * dx + dy * dy + dz * dz;
+    }
+
     private bool ShouldSubdivide(Node node, Vector3 playerPos)
     {
         int level = node.divisions - 1; // 0 = finest, divisions-1 = coarsest
@@ -204,7 +240,8 @@ public class Octree : MonoBehaviour
             ? lodRadii[level]
             : node.NodeScale() * 2f;   // fallback
 
-        return AabbSqrDist(node, playerPos) < radius * radius;
+        // Use bias-weighted distance so vertical nodes collapse sooner
+        return AabbSqrDistLod(node, playerPos) < radius * radius;
     }
 
     // -----------------------------------------------------------------------

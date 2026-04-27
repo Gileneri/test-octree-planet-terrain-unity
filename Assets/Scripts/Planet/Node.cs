@@ -143,7 +143,9 @@ public class Node
             {
                 var mesh = new Mesh { name = "node_mesh", bounds = bounds };
                 Mesh.ApplyAndDisposeWritableMeshData(meshDataArray, mesh);
-                mesh.RecalculateNormals();
+                // Normals are written per-face inside NodeJob (Tables.Normals[side])
+                // and arrive ready in stream 1 — RecalculateNormals() is not needed
+                // and would block the main thread re-computing what we already have.
                 capturedFilter.mesh = mesh;
                 if (capturedCollider != null) capturedCollider.sharedMesh = mesh;
                 isScheduled = false;

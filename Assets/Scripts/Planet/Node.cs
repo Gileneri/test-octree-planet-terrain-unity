@@ -38,9 +38,16 @@ public class Node
 
         meshFilter = gameObject.GetComponent<MeshFilter>();
         meshRenderer = gameObject.GetComponent<MeshRenderer>();
-        meshCollider = gameObject.GetComponent<MeshCollider>();
-        if (meshCollider == null)
-            meshCollider = gameObject.AddComponent<MeshCollider>();
+
+        // Only attach a MeshCollider on fine-grained nodes (small voxels).
+        // Coarse nodes have voxels too large for PhysX (>500u triangle warning).
+        // maxColliderDivisions is computed by OctreeGrid so voxelSize <= 32u.
+        if (divisions <= octree.maxColliderDivisions)
+        {
+            meshCollider = gameObject.GetComponent<MeshCollider>();
+            if (meshCollider == null)
+                meshCollider = gameObject.AddComponent<MeshCollider>();
+        }
 
         var pos = NodePosition();
         gameObject.transform.position = pos;
@@ -52,14 +59,14 @@ public class Node
     public void Clear()
     {
         meshFilter.mesh = null;
-        meshCollider.sharedMesh = null;
+        if (meshCollider != null) meshCollider.sharedMesh = null;
         needsDrawn = true;
     }
 
     public void MarkDirty()
     {
         meshFilter.mesh = null;
-        meshCollider.sharedMesh = null;
+        if (meshCollider != null) meshCollider.sharedMesh = null;
         needsDrawn = true;
         isScheduled = false;
     }
@@ -107,6 +114,11 @@ public class Node
             noiseSeed = octree.noiseSeed,
             noiseTypeId = octree.noiseTypeId,
             minSubsurfaceHeight = octree.minSubsurfaceHeight,
+            cavesEnabled = octree.cavesEnabled,
+            caveNoiseFrequency = octree.caveNoiseFrequency,
+            caveNoiseThreshold = octree.caveNoiseThreshold,
+            caveNoiseAmplitudeY = octree.caveNoiseAmplitudeY,
+            caveSurfaceFadeRange = octree.caveSurfaceFadeRange,
             // ───────────────────────────────────────────────────────────────
             chunkResolution = octree.chunkResolution,
             nodeScale = NodeScale(),
@@ -133,7 +145,7 @@ public class Node
                 Mesh.ApplyAndDisposeWritableMeshData(meshDataArray, mesh);
                 mesh.RecalculateNormals();
                 capturedFilter.mesh = mesh;
-                capturedCollider.sharedMesh = mesh;
+                if (capturedCollider != null) capturedCollider.sharedMesh = mesh;
                 isScheduled = false;
                 if (modKeys.IsCreated) modKeys.Dispose();
                 if (modValues.IsCreated) modValues.Dispose();

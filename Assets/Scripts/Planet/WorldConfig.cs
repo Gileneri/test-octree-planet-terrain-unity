@@ -91,6 +91,27 @@ public class WorldConfig : ScriptableObject
     public int chunkResolution = 8;
 
     // ------------------------------------------------------------------
+    // Caves
+    // ------------------------------------------------------------------
+
+    [Header("Caves")]
+    [Tooltip("Enable procedural cave generation. No code changes needed — slot is wired end-to-end.")]
+    public bool cavesEnabled = false;
+
+    [Tooltip("3-D noise frequency for cave tunnels. Typical: 0.005–0.02.")]
+    public float caveNoiseFrequency = 0.008f;
+
+    [Tooltip("Noise threshold above which a voxel becomes a cave. Range [-1,1]. Higher = fewer/thinner caves.")]
+    [Range(-1f, 1f)]
+    public float caveNoiseThreshold = 0.55f;
+
+    [Tooltip("Vertical squish factor. Below 1.0 makes caves tunnel-shaped rather than spherical.")]
+    public float caveNoiseAmplitudeY = 0.4f;
+
+    [Tooltip("Y units below the surface over which caves fade in. Prevents caves punching through the ground.")]
+    public float caveSurfaceFadeRange = 20f;
+
+    // ------------------------------------------------------------------
     // Render
     // ------------------------------------------------------------------
 
@@ -182,6 +203,11 @@ public class WorldConfig : ScriptableObject
         minSubsurfaceHeight = p.minSubsurfaceHeight;
         divisions = p.divisions;
         chunkResolution = p.chunkResolution;
+        cavesEnabled = p.cavesEnabled;
+        caveNoiseFrequency = p.caveNoiseFrequency;
+        caveNoiseThreshold = p.caveNoiseThreshold;
+        caveNoiseAmplitudeY = p.caveNoiseAmplitudeY;
+        caveSurfaceFadeRange = p.caveSurfaceFadeRange;
         renderRadius = p.renderRadius;
     }
 
@@ -197,10 +223,14 @@ public class WorldConfig : ScriptableObject
         minSubsurfaceHeight = minSubsurfaceHeight,
         divisions = divisions,
         chunkResolution = chunkResolution,
+        cavesEnabled = cavesEnabled,
+        caveNoiseFrequency = caveNoiseFrequency,
+        caveNoiseThreshold = caveNoiseThreshold,
+        caveNoiseAmplitudeY = caveNoiseAmplitudeY,
+        caveSurfaceFadeRange = caveSurfaceFadeRange,
         renderRadius = renderRadius,
     };
 
-    // Matches the exact key names used by the web editor
     [Serializable]
     private class JsonPayload
     {
@@ -214,6 +244,11 @@ public class WorldConfig : ScriptableObject
         public float minSubsurfaceHeight;
         public int divisions;
         public int chunkResolution;
+        public bool cavesEnabled;
+        public float caveNoiseFrequency;
+        public float caveNoiseThreshold;
+        public float caveNoiseAmplitudeY;
+        public float caveSurfaceFadeRange;
         public int renderRadius;
     }
 }

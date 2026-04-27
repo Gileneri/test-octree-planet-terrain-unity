@@ -81,15 +81,30 @@ public class WorldConfigLoader : MonoBehaviour
         grid.noiseSeed = config.seed;
         grid.noiseTypeId = NodeJob.NoiseTypeToId(config.noiseType);
         grid.minSubsurfaceHeight = config.minSubsurfaceHeight;
+        grid.cavesEnabled = config.cavesEnabled;
+        grid.caveNoiseFrequency = config.caveNoiseFrequency;
+        grid.caveNoiseThreshold = config.caveNoiseThreshold;
+        grid.caveNoiseAmplitudeY = config.caveNoiseAmplitudeY;
+        grid.caveSurfaceFadeRange = config.caveSurfaceFadeRange;
         grid.divisions = config.divisions;
         grid.chunkResolution = config.chunkResolution;
         grid.renderRadius = config.renderRadius;
+
+        // Also push floor to WorldModifications so digs below the floor are
+        // rejected at the data layer before they are even recorded
+        if (WorldModifications.Instance != null)
+        {
+            WorldModifications.Instance.worldSizeX = config.worldSizeX;
+            WorldModifications.Instance.worldSizeZ = config.worldSizeZ;
+            WorldModifications.Instance.minSubsurfaceHeight = config.minSubsurfaceHeight;
+        }
 
         Debug.Log($"[WorldConfigLoader] Applied '{config.worldName}' → OctreeGrid. " +
                   $"World={config.worldSizeX}×{config.worldSizeZ}  " +
                   $"SurfaceBase={config.surfaceBaseHeight}  " +
                   $"Seed={config.seed}  NoiseType={config.noiseType}(id={grid.noiseTypeId})  " +
                   $"MinSubY={config.minSubsurfaceHeight}  " +
+                  $"Caves={config.cavesEnabled}  " +
                   $"Divisions={config.divisions}  ChunkRes={config.chunkResolution}  " +
                   $"RenderRadius={config.renderRadius}");
     }

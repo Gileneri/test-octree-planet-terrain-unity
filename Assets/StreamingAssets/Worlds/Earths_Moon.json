@@ -5,9 +5,14 @@
     "worldSizeX": 50000.0,
     "worldSizeZ": 50000.0,
     "surfaceBaseHeight": 0.0,
-    "surfaceNoiseAmplitude": 300.0,
-    "minSubsurfaceHeight": -100.0,
-    "divisions": 7,
-    "chunkResolution": 8,
-    "renderRadius": 6
+    "surfaceNoiseAmplitude": 64.0,
+    "minSubsurfaceHeight": -500.0,
+    "divisions": 16,
+    "chunkResolution": 32,
+    "cavesEnabled": true,
+    "caveNoiseFrequency": 0.035999998450279239,
+    "caveNoiseThreshold": 0.1599999964237213,
+    "caveNoiseAmplitudeY": 1.350000023841858,
+    "caveSurfaceFadeRange": 29.0,
+    "renderRadius": 7
 }

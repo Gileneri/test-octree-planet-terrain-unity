@@ -150,6 +150,7 @@ MonoBehaviour:
   m_EditorClassIdentifier: Assembly-CSharp::WorldModifications
   worldSizeX: 0
   worldSizeZ: 0
+  minSubsurfaceHeight: -Infinity
 --- !u!4 &854999
 Transform:
   m_ObjectHideFlags: 0
@@ -543,6 +544,7 @@ GameObject:
   m_Component:
   - component: {fileID: 1650284251}
   - component: {fileID: 1650284250}
+  - component: {fileID: 1650284252}
   m_Layer: 0
   m_Name: OctreeGrid
   m_TagString: Untagged
@@ -566,6 +568,14 @@ MonoBehaviour:
   worldSizeZ: 50000
   surfaceBaseHeight: 0
   surfaceNoiseAmplitude: 64
+  noiseSeed: 2376
+  noiseTypeId: 0
+  minSubsurfaceHeight: -500
+  cavesEnabled: 1
+  caveNoiseFrequency: 0.008
+  caveNoiseThreshold: 0.55
+  caveNoiseAmplitudeY: 0.4
+  caveSurfaceFadeRange: 20
   divisions: 6
   chunkResolution: 32
   lodDistanceCurve:
@@ -610,8 +620,8 @@ MonoBehaviour:
     m_PreInfinity: 2
     m_PostInfinity: 2
     m_RotationOrder: 4
-  renderRadius: 10
-  maxJobsPerFrame: 160
+  renderRadius: 7
+  maxJobsPerFrame: 60
   newCellsPerFrame: 3
   maxNodeCreationsPerFrame: 50
   predictionDistance: 3
@@ -635,6 +645,20 @@ Transform:
   m_Children: []
   m_Father: {fileID: 0}
   m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
+--- !u!114 &1650284252
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1650284249}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 0b690f34177ad154db497e882dbcde65, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: Assembly-CSharp::WorldConfigLoader
+  config: {fileID: 11400000, guid: b53b98ad8d158da4e8dc153101e929ff, type: 2}
+  loadFromJsonOnAwake: 1
 --- !u!1 &2078612303
 GameObject:
   m_ObjectHideFlags: 0

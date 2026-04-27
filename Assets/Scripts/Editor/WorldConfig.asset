@@ -19,8 +19,13 @@ MonoBehaviour:
   worldSizeX: 50000
   worldSizeZ: 50000
   surfaceBaseHeight: 0
-  surfaceNoiseAmplitude: 300
+  surfaceNoiseAmplitude: 64
   minSubsurfaceHeight: -500
-  divisions: 7
-  chunkResolution: 8
-  renderRadius: 6
+  divisions: 6
+  chunkResolution: 32
+  cavesEnabled: 1
+  caveNoiseFrequency: 0.036
+  caveNoiseThreshold: 0.16
+  caveNoiseAmplitudeY: 1.35
+  caveSurfaceFadeRange: 29
+  renderRadius: 10

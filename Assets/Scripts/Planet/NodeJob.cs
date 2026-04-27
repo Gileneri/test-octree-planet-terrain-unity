@@ -5,94 +5,100 @@ using Unity.Mathematics;
 using Unity.Burst;
 
 /// <summary>
-/// Generates voxel mesh data for a single octree node.
+/// Generates voxel mesh data for a single octree node using a layered
+/// density pipeline.
 ///
-/// MODIFICATIONS:
-///   Before scheduling, the main thread copies all WorldModifications that
-///   overlap this node into two parallel NativeArrays (modKeys / modValues).
-///   IsAirWorldPos checks those arrays first; only if no override is found
-///   does it fall back to the procedural noise.
+/// ═══════════════════════════════════════════════════════════════════
+///  DENSITY PIPELINE  (SampleDensity — top = highest priority)
+/// ═══════════════════════════════════════════════════════════════════
 ///
-/// SEAMLESS WRAP:
-///   XZ positions are wrapped via PosMod before noise sampling using the
-///   4-D toroidal embedding (cos/sin) so the terrain tiles with no seam.
+///  Layer 0 — FLOOR
+///    Voxels below minSubsurfaceHeight are unconditionally Solid.
+///    Nothing can override this — not player digs, not caves.
 ///
-/// WORLD CONFIG INTEGRATION (added):
-///   noiseSeed, noiseTypeId and minSubsurfaceHeight are now job fields
-///   filled by Node.TryCollectJob from Octree, which receives them from
-///   OctreeGrid, which receives them from WorldConfigLoader.
-///   No hard-coded values remain for these settings.
+///  Layer 1 — PLAYER MODIFICATIONS
+///    Explicit Air / Solid overrides from BlockInteraction.
+///    Stored in modKeys / modValues (snapshot prepared before scheduling).
+///
+///  Layer 2 — PROCEDURAL SURFACE
+///    Toroidal noise surface that shapes the terrain.
+///    Voxels above surfaceY → Air.
+///    Voxels below surfaceY → Solid (falls through to Layer 3).
+///
+///  Layer 3 — PROCEDURAL CAVES  [reserved — enable via cavesEnabled]
+///    3-D worm noise carved from the solid underground region.
+///    Fades out near the surface so caves never punch through.
+///
+/// ═══════════════════════════════════════════════════════════════════
+///  ENABLING CAVES
+/// ═══════════════════════════════════════════════════════════════════
+///  In WorldConfig (and Earths_Moon.json):
+///    "cavesEnabled": true
+///    "caveNoiseFrequency": 0.008
+///    "caveNoiseThreshold": 0.55
+///    "caveNoiseAmplitudeY": 0.4
+///    "caveSurfaceFadeRange": 20.0
+///
+///  No code changes required — the slot is already wired end-to-end.
 /// </summary>
 [BurstCompile]
 public struct NodeJob : IJob
 {
+    // ── Mesh output ───────────────────────────────────────────────────────
     public Bounds bounds;
     public Mesh.MeshDataArray meshDataArray;
 
+    // ── World ─────────────────────────────────────────────────────────────
     public float worldSizeX;
     public float worldSizeZ;
+
+    // ── Layer 0 : Floor ───────────────────────────────────────────────────
+    public float minSubsurfaceHeight;
+
+    // ── Layer 1 : Player modifications ────────────────────────────────────
+    [ReadOnly] public NativeArray<int3> modKeys;
+    [ReadOnly] public NativeArray<byte> modValues;
+
+    // ── Layer 2 : Procedural surface ──────────────────────────────────────
     public float surfaceBaseHeight;
     public float surfaceNoiseAmplitude;
-
-    // ── WorldConfig-driven fields (were hard-coded before) ────────────────
-    /// <summary>
-    /// FastNoiseLite seed. Maps directly to noise.SetSeed().
-    /// </summary>
     public int noiseSeed;
+    public int noiseTypeId;   // 0=OpenSimplex2  1=OpenSimplex2S  2=Perlin
 
-    /// <summary>
-    /// Noise type as an integer so Burst can handle it without managed enums.
-    /// Use NodeJob.NoiseTypeToId() on the main thread to convert the string
-    /// from WorldConfig (e.g. "OpenSimplex2") to the right integer.
-    /// 0=OpenSimplex2 (default), 1=OpenSimplex2S, 2=Cellular,
-    /// 3=Perlin, 4=ValueCubic, 5=Value.
-    /// </summary>
-    public int noiseTypeId;
+    // ── Layer 3 : Caves ───────────────────────────────────────────────────
+    public bool cavesEnabled;
+    public float caveNoiseFrequency;    // typical 0.005–0.02
+    public float caveNoiseThreshold;    // typical 0.4–0.7 (higher = fewer caves)
+    public float caveNoiseAmplitudeY;   // vertical squish, typical 0.3–0.6
+    public float caveSurfaceFadeRange;  // Y units below surface where caves fade in
 
-    /// <summary>
-    /// Hard floor for solid terrain.  Any voxel whose world-Y is below this
-    /// value is always solid, regardless of the noise surface.
-    /// Set to a very negative number (e.g. -9999) to disable.
-    /// </summary>
-    public float minSubsurfaceHeight;
-    // ─────────────────────────────────────────────────────────────────────
-
+    // ── Chunk ─────────────────────────────────────────────────────────────
     public int chunkResolution;
     public float nodeScale;
     public float3 worldNodePosition;
 
-    // Modification overrides for this node (prepared on main thread before scheduling)
-    // Each entry: modKeys[i] is a wrapped voxel position, modValues[i] is 0=Solid 1=Air
-    [ReadOnly] public NativeArray<int3> modKeys;
-    [ReadOnly] public NativeArray<byte> modValues;
-
+    // ── Private ───────────────────────────────────────────────────────────
     private float3 centerOffset;
     private float normalizedVoxelScale;
 
-    // -----------------------------------------------------------------------
-    //  Noise type id helper  (call on main thread — not inside Burst)
-    // -----------------------------------------------------------------------
+    // ═══════════════════════════════════════════════════════════════════════
+    //  Main-thread helper
+    // ═══════════════════════════════════════════════════════════════════════
 
-    /// <summary>
-    /// Converts the noiseType string from WorldConfig to the integer id that
-    /// NodeJob.noiseTypeId expects.  Falls back to 0 (OpenSimplex2) for
-    /// unrecognised values.
-    /// Available in this FastNoiseLite build:
-    ///   0 = OpenSimplex2 (default)
-    ///   1 = OpenSimplex2S
-    ///   2 = Perlin
-    /// </summary>
     public static int NoiseTypeToId(string noiseType)
     {
         switch (noiseType)
         {
             case "OpenSimplex2S": return 1;
             case "Perlin": return 2;
-            default: return 0; // OpenSimplex2
+            default: return 0;
         }
     }
 
-    // -----------------------------------------------------------------------
+    // ═══════════════════════════════════════════════════════════════════════
+    //  Execute
+    // ═══════════════════════════════════════════════════════════════════════
+
     public void Execute()
     {
         int maxCubes = (int)math.ceil(chunkResolution * chunkResolution * chunkResolution / 2f);
@@ -106,19 +112,22 @@ public struct NodeJob : IJob
         centerOffset = new float3(1f, 1f, 1f) * (nodeScale * 0.5f);
         normalizedVoxelScale = nodeScale / chunkResolution;
 
-        var noise = new FastNoiseLite();
-        noise.SetSeed(noiseSeed);
-        noise.SetFrequency(0.003f);
-
-        // Apply noise type from the id field.
-        // Only types enabled in this FastNoiseLite build:
-        // 0=OpenSimplex2, 1=OpenSimplex2S, 2=Perlin
+        // Layer 2 — surface noise
+        var surfaceNoise = new FastNoiseLite();
+        surfaceNoise.SetSeed(noiseSeed);
+        surfaceNoise.SetFrequency(0.003f);
         switch (noiseTypeId)
         {
-            case 1: noise.SetNoiseType(FastNoiseLite.NoiseType.OpenSimplex2S); break;
-            case 2: noise.SetNoiseType(FastNoiseLite.NoiseType.Perlin); break;
-            default: noise.SetNoiseType(FastNoiseLite.NoiseType.OpenSimplex2); break;
+            case 1: surfaceNoise.SetNoiseType(FastNoiseLite.NoiseType.OpenSimplex2S); break;
+            case 2: surfaceNoise.SetNoiseType(FastNoiseLite.NoiseType.Perlin); break;
+            default: surfaceNoise.SetNoiseType(FastNoiseLite.NoiseType.OpenSimplex2); break;
         }
+
+        // Layer 3 — cave noise (always constructed; only sampled when cavesEnabled)
+        var caveNoise = new FastNoiseLite();
+        caveNoise.SetSeed(noiseSeed + 9371);    // decorrelated from surface
+        caveNoise.SetFrequency(caveNoiseFrequency > 0f ? caveNoiseFrequency : 0.008f);
+        caveNoise.SetNoiseType(FastNoiseLite.NoiseType.OpenSimplex2);
 
         int vi = 0;
         int ii = 0;
@@ -127,14 +136,14 @@ public struct NodeJob : IJob
             for (int y = 0; y < chunkResolution; y++)
                 for (int z = 0; z < chunkResolution; z++)
                 {
-                    if (IsAir(x, y, z, ref noise)) continue;
+                    if (IsAir(x, y, z, ref surfaceNoise, ref caveNoise)) continue;
 
                     float3 localPos = new float3(x, y, z) * normalizedVoxelScale - centerOffset;
 
                     for (int side = 0; side < 6; side++)
                     {
                         int3 nb = Tables.NeighborOffset[side];
-                        if (!IsAir(x + nb.x, y + nb.y, z + nb.z, ref noise)) continue;
+                        if (!IsAir(x + nb.x, y + nb.y, z + nb.z, ref surfaceNoise, ref caveNoise)) continue;
 
                         vertices[vi + 0] = Tables.Vertices[Tables.BuildOrder[side][0]] * normalizedVoxelScale + localPos;
                         vertices[vi + 1] = Tables.Vertices[Tables.BuildOrder[side][1]] * normalizedVoxelScale + localPos;
@@ -165,25 +174,30 @@ public struct NodeJob : IJob
         MeshingUtility.ApplyMesh(ref meshDataArray, ref idxSlice, ref vtxSlice, ref nrmSlice, ref bounds);
     }
 
-    // -----------------------------------------------------------------------
-    //  Density
-    // -----------------------------------------------------------------------
+    // ═══════════════════════════════════════════════════════════════════════
+    //  Density pipeline
+    // ═══════════════════════════════════════════════════════════════════════
 
-    private bool IsAir(int lx, int ly, int lz, ref FastNoiseLite noise)
+    private bool IsAir(int lx, int ly, int lz,
+        ref FastNoiseLite surfaceNoise, ref FastNoiseLite caveNoise)
     {
         float3 wp = new float3(lx, ly, lz) * normalizedVoxelScale
-                    + worldNodePosition
-                    - centerOffset;
-        return IsAirWorldPos(wp, ref noise);
+                    + worldNodePosition - centerOffset;
+        return SampleDensity(wp, ref surfaceNoise, ref caveNoise);
     }
 
-    private bool IsAirWorldPos(float3 wp, ref FastNoiseLite noise)
+    /// <summary>
+    /// Returns true = Air, false = Solid.
+    /// Layers are evaluated top to bottom; the first definitive answer wins.
+    /// </summary>
+    private bool SampleDensity(float3 wp,
+        ref FastNoiseLite surfaceNoise, ref FastNoiseLite caveNoise)
     {
-        // Hard floor: always solid below minSubsurfaceHeight
-        if (wp.y < minSubsurfaceHeight) return false;
+        // ── Layer 0 : Floor ────────────────────────────────────────────────
+        if (wp.y < minSubsurfaceHeight)
+            return false; // Solid — unconditional, nothing overrides
 
-        // --- Check modification overrides first ---
-        // The key is the wrapped integer voxel coordinate, matching WorldModifications.WrapKey
+        // ── Layer 1 : Player modifications ────────────────────────────────
         int3 key = new int3(
             (int)math.floor(PosMod(wp.x, worldSizeX)),
             (int)math.floor(wp.y),
@@ -192,17 +206,20 @@ public struct NodeJob : IJob
 
         for (int i = 0; i < modKeys.Length; i++)
         {
-            if (modKeys[i].x == key.x && modKeys[i].y == key.y && modKeys[i].z == key.z)
+            if (modKeys[i].x == key.x &&
+                modKeys[i].y == key.y &&
+                modKeys[i].z == key.z)
+            {
                 return modValues[i] == 1; // 1 = Air, 0 = Solid
+            }
         }
 
-        // --- Procedural noise fallback ---
+        // ── Layer 2 : Procedural surface ──────────────────────────────────
         float wx = PosMod(wp.x, worldSizeX);
         float wz = PosMod(wp.z, worldSizeZ);
 
         float aX = wx / worldSizeX * 2f * math.PI;
         float aZ = wz / worldSizeZ * 2f * math.PI;
-
         float R = worldSizeX / (2f * math.PI);
         float S = worldSizeZ / (2f * math.PI);
 
@@ -211,17 +228,37 @@ public struct NodeJob : IJob
         float cz = math.cos(aZ) * S;
         float sz = math.sin(aZ) * S;
 
-        float n1 = noise.GetNoise(cx, sx, cz);
-        float n2 = noise.GetNoise(cz + 100f, sz + 100f, cx * 0.5f);
-        float n3 = noise.GetNoise(sx * 0.7f, sz * 0.7f + 200f, cz * 0.3f);
+        float n1 = surfaceNoise.GetNoise(cx, sx, cz);
+        float n2 = surfaceNoise.GetNoise(cz + 100f, sz + 100f, cx * 0.5f);
+        float n3 = surfaceNoise.GetNoise(sx * 0.7f, sz * 0.7f + 200f, cz * 0.3f);
 
-        float h = n1 * 0.6f + n2 * 0.3f + n3 * 0.1f;
-        float surfaceY = surfaceBaseHeight + h * surfaceNoiseAmplitude;
+        float surfaceY = surfaceBaseHeight + (n1 * 0.6f + n2 * 0.3f + n3 * 0.1f) * surfaceNoiseAmplitude;
 
-        return wp.y > surfaceY;
+        if (wp.y > surfaceY)
+            return true; // Air — above surface, caves can't carve air
+
+        // ── Layer 3 : Procedural caves ────────────────────────────────────
+        if (!cavesEnabled)
+            return false; // Solid — underground, caves disabled
+
+        // Fade caves out near the surface so they never punch a hole through
+        float depthBelowSurface = surfaceY - wp.y;
+        float fade = caveSurfaceFadeRange > 0f
+            ? math.saturate(depthBelowSurface / caveSurfaceFadeRange)
+            : 1f;
+
+        // Y squished so caves are tunnel-shaped rather than spherical
+        float cn = caveNoise.GetNoise(wp.x, wp.y * caveNoiseAmplitudeY, wp.z);
+
+        // At fade=0 (surface) the threshold is 1.0 (impossible to be air → solid)
+        // At fade=1 (deep)    the threshold is caveNoiseThreshold
+        float effectiveThreshold = math.lerp(1f, caveNoiseThreshold, fade);
+
+        return cn > effectiveThreshold; // Air = inside a cave tunnel
     }
 
-    // -----------------------------------------------------------------------
+    // ═══════════════════════════════════════════════════════════════════════
+
     private static float PosMod(float x, float m)
     {
         float r = x % m;

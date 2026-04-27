@@ -57,6 +57,15 @@ public class OctreeGrid : MonoBehaviour
     [Tooltip("Hard floor Y. Voxels below this are always solid. " +
              "Populated by WorldConfigLoader from the world JSON.")]
     public float minSubsurfaceHeight = -500f;
+
+    [Header("Caves")]
+    [Tooltip("Enable procedural cave generation.")]
+    public bool cavesEnabled = false;
+    public float caveNoiseFrequency = 0.008f;
+    [Range(-1f, 1f)]
+    public float caveNoiseThreshold = 0.55f;
+    public float caveNoiseAmplitudeY = 0.4f;
+    public float caveSurfaceFadeRange = 20f;
     // ─────────────────────────────────────────────────────────────────────
 
     [Header("Octree per cell")]
@@ -148,6 +157,7 @@ public class OctreeGrid : MonoBehaviour
         }
 
         BakeLodRadii();
+        ComputeMaxColliderDivisions();
 
         Debug.Log($"[OctreeGrid] cellSize={cellSize}  renderRadius={renderRadius}  " +
                   $"grid={(renderRadius * 2 + 1)}×{(renderRadius * 2 + 1)}  " +
@@ -276,11 +286,42 @@ public class OctreeGrid : MonoBehaviour
     public void RebakeLodRadii()
     {
         BakeLodRadii();
+        ComputeMaxColliderDivisions();
         foreach (var oct in activeCells.Values)
         {
             oct.lodRadii = lodRadii;
+            oct.maxColliderDivisions = _maxColliderDivisions;
+            oct.undergroundCullDepth = cellSize * 1.5f;
             oct.ForceRebuildTree();
         }
+    }
+
+    // Cached result of ComputeMaxColliderDivisions
+    private int _maxColliderDivisions = 2;
+
+    /// <summary>
+    /// Computes the highest division level where voxelSize stays at or below
+    /// 32 units — the safe limit for PhysX triangle meshes.
+    /// voxelSize = chunkResolution * 2^(level-1) / chunkResolution
+    ///           = 2^(level-1)   ... wait, voxelSize = nodeScale / chunkResolution
+    ///           = (chunkRes * 2^(div-1)) / chunkRes = 2^(div-1)
+    /// So voxelSize <= 32  =>  2^(div-1) <= 32  =>  div-1 <= 5  =>  div <= 6.
+    /// We cap at divisions so we never exceed the tree depth.
+    /// </summary>
+    private void ComputeMaxColliderDivisions()
+    {
+        // voxelSize at division d = 2^(d-1)
+        // find highest d where 2^(d-1) <= 32
+        int maxDiv = 1;
+        for (int d = 1; d <= divisions; d++)
+        {
+            float voxelSize = Mathf.Pow(2f, d - 1);
+            if (voxelSize <= 32f) maxDiv = d;
+            else break;
+        }
+        _maxColliderDivisions = maxDiv;
+        Debug.Log($"[OctreeGrid] maxColliderDivisions={_maxColliderDivisions} " +
+                  $"(voxelSize at that level = {Mathf.Pow(2f, _maxColliderDivisions - 1):F0}u)");
     }
 
     private void BakeLodRadii()
@@ -401,6 +442,11 @@ public class OctreeGrid : MonoBehaviour
         octree.noiseSeed = noiseSeed;
         octree.noiseTypeId = noiseTypeId;
         octree.minSubsurfaceHeight = minSubsurfaceHeight;
+        octree.cavesEnabled = cavesEnabled;
+        octree.caveNoiseFrequency = caveNoiseFrequency;
+        octree.caveNoiseThreshold = caveNoiseThreshold;
+        octree.caveNoiseAmplitudeY = caveNoiseAmplitudeY;
+        octree.caveSurfaceFadeRange = caveSurfaceFadeRange;
         // ───────────────────────────────────────────────────────────────────
         octree.divisions = divisions;
         octree.chunkResolution = chunkResolution;
@@ -408,6 +454,8 @@ public class OctreeGrid : MonoBehaviour
         octree.priority = priority;
         octree.chunkPrefab = chunkPrefab;
         octree.cellOrigin = CellToWorld(cell);
+        octree.maxColliderDivisions = _maxColliderDivisions;
+        octree.undergroundCullDepth = cellSize * 1.5f;
         octree.lodRadii = lodRadii;   // share the baked array — read-only at runtime
 
         octree.Initialize();

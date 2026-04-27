@@ -1,26 +1,35 @@
 using System.Collections.Generic;
 using UnityEngine;
-using Unity.Mathematics;
 
 /// <summary>
 /// Singleton that stores every player-made voxel modification.
 ///
-/// Key   : world-space voxel position wrapped into [0, worldSizeX) × (Y free) × [0, worldSizeZ).
-///         Wrapping is done here so lookups from NodeJob (which also wraps) always match.
-/// Value : VoxelState — Air (dug out) or Solid (placed block).
+/// ARCHITECTURE — Position in the Density Pipeline
+/// ─────────────────────────────────────────────────
+/// This class is Layer 1 of NodeJob's density pipeline.
 ///
-/// Thread-safety note:
-///   The dictionary is written only from the main thread (BlockInteraction).
-///   NodeJob reads a NativeHashMap copy that is prepared before the job runs.
-///   So there is no concurrent access issue.
+///   Layer 0  FLOOR          — enforced here first: Set() rejects Air mods
+///                             below minSubsurfaceHeight so invalid digs
+///                             are never even recorded.
+///   Layer 1  MODIFICATIONS  — this class (player digs / placements)
+///   Layer 2  SURFACE NOISE  — procedural terrain height
+///   Layer 3  CAVE NOISE     — procedural caves (enable in WorldConfig)
+///
+/// THREAD-SAFETY
+/// ─────────────
+/// Written only from the main thread (BlockInteraction).
+/// NodeJob reads a NativeArray snapshot prepared before scheduling.
+/// No concurrent access.
 /// </summary>
 public class WorldModifications : MonoBehaviour
 {
     public static WorldModifications Instance { get; private set; }
 
-    // Exposed so Octree can read worldSize when preparing NativeHashMap copies
+    // Populated by WorldConfigLoader so this class can enforce the floor
+    // before a dig attempt is recorded (gives BlockInteraction immediate feedback)
     [HideInInspector] public float worldSizeX;
     [HideInInspector] public float worldSizeZ;
+    [HideInInspector] public float minSubsurfaceHeight = float.NegativeInfinity;
 
     public enum VoxelState : byte
     {
@@ -28,7 +37,6 @@ public class WorldModifications : MonoBehaviour
         Air = 1,  // player dug this block out
     }
 
-    // Main storage: wrapped voxel position → state override
     private readonly Dictionary<Vector3Int, VoxelState> modifications
         = new Dictionary<Vector3Int, VoxelState>();
 
@@ -36,66 +44,69 @@ public class WorldModifications : MonoBehaviour
 
     private void Awake()
     {
-        if (Instance != null && Instance != this)
-        {
-            Destroy(gameObject);
-            return;
-        }
+        if (Instance != null && Instance != this) { Destroy(gameObject); return; }
         Instance = this;
     }
 
     // -----------------------------------------------------------------------
-    //  Public API (called from main thread only)
+    //  Public API  (main thread only)
     // -----------------------------------------------------------------------
 
-    /// <summary>Sets a voxel override at the given world position.</summary>
-    public void Set(Vector3 worldPos, VoxelState state)
+    /// <summary>
+    /// Records a voxel override at the given world position.
+    ///
+    /// Air modifications below minSubsurfaceHeight are silently rejected so
+    /// the floor is enforced at the data layer, not just at render time.
+    /// Returns false if the modification was rejected (use to give the
+    /// player feedback — e.g. play a "can't dig here" sound).
+    /// </summary>
+    public bool Set(Vector3 worldPos, VoxelState state)
     {
-        Vector3Int key = WrapKey(worldPos);
-        modifications[key] = state;
+        if (state == VoxelState.Air && worldPos.y < minSubsurfaceHeight)
+            return false;
+
+        modifications[WrapKey(worldPos)] = state;
+        return true;
     }
 
-    /// <summary>Removes any override at the given world position (reverts to noise).</summary>
-    public void Remove(Vector3 worldPos)
-    {
-        modifications.Remove(WrapKey(worldPos));
-    }
+    /// <summary>Removes any override, reverting the voxel to procedural generation.</summary>
+    public void Remove(Vector3 worldPos) => modifications.Remove(WrapKey(worldPos));
 
-    /// <summary>Returns true if an override exists and writes it to <paramref name="state"/>.</summary>
+    /// <summary>Returns true if an override exists for this position.</summary>
     public bool TryGet(Vector3 worldPos, out VoxelState state)
-    {
-        return modifications.TryGetValue(WrapKey(worldPos), out state);
-    }
+        => modifications.TryGetValue(WrapKey(worldPos), out state);
 
-    /// <summary>Total number of stored modifications (for debug UI).</summary>
+    /// <summary>
+    /// Returns true if digging is permitted at this Y coordinate.
+    /// Call this in BlockInteraction before Set() to give immediate UI feedback.
+    /// </summary>
+    public bool IsAboveFloor(float worldY) => worldY >= minSubsurfaceHeight;
+
+    /// <summary>Total number of stored modifications (for the debug HUD).</summary>
     public int Count => modifications.Count;
 
     /// <summary>
-    /// Copies all modifications into a flat array suitable for passing to a Burst job.
-    /// Only modifications whose wrapped XZ falls inside the node's AABB are included,
-    /// so the array stays small for each individual job.
+    /// Copies all modifications that overlap a node's AABB into flat arrays
+    /// for passing to a Burst job (NodeJob.modKeys / modValues).
+    ///
+    /// The AABB is expanded by 1 voxel so NodeJob can correctly evaluate
+    /// neighbour voxels that sit just outside this chunk's border — needed
+    /// for correct face culling at seams between chunks.
     /// </summary>
     public void GetModificationsForNode(
         Vector3 nodeWorldPos, float nodeScale, int chunkResolution,
         out Vector3Int[] keys, out VoxelState[] values)
     {
-        // Expand the AABB by exactly 1 voxel on every side.
-        // When the NodeJob checks a neighbour voxel that sits just outside
-        // this chunk's border (local index = -1 or chunkResolution), it
-        // converts that to a world position and calls IsAirWorldPos, which
-        // looks up modKeys. Without the expansion, modifications in the
-        // adjacent chunk are not in modKeys, so the job falls back to noise
-        // and renders a phantom face / missing face on the seam.
         float voxelSize = nodeScale / chunkResolution;
-        float half = nodeScale * 0.5f + voxelSize;   // +1 voxel border
+        float half = nodeScale * 0.5f + voxelSize;
+
         var kList = new List<Vector3Int>();
         var vList = new List<VoxelState>();
 
         foreach (var kv in modifications)
         {
-            // Un-wrap the key back to a "closest" world position near the node
-            // so we can do an AABB test properly.
             Vector3 wp = ClosestWorldPos(kv.Key, nodeWorldPos);
+
             if (wp.x >= nodeWorldPos.x - half && wp.x <= nodeWorldPos.x + half &&
                 wp.y >= nodeWorldPos.y - half && wp.y <= nodeWorldPos.y + half &&
                 wp.z >= nodeWorldPos.z - half && wp.z <= nodeWorldPos.z + half)
@@ -110,32 +121,26 @@ public class WorldModifications : MonoBehaviour
     }
 
     // -----------------------------------------------------------------------
-    //  Internal helpers
+    //  Key helpers
     // -----------------------------------------------------------------------
 
     /// <summary>
     /// Converts a world position to a wrapped integer voxel key.
-    /// We use Mathf.FloorToInt so sub-voxel positions map to the same cell.
+    /// Must match the key computation in NodeJob.SampleDensity() exactly.
     /// </summary>
     public Vector3Int WrapKey(Vector3 worldPos)
     {
         int x = Mathf.FloorToInt(PosMod(worldPos.x, worldSizeX));
-        int y = Mathf.FloorToInt(worldPos.y);                      // Y is never wrapped
+        int y = Mathf.FloorToInt(worldPos.y);   // Y is never wrapped
         int z = Mathf.FloorToInt(PosMod(worldPos.z, worldSizeZ));
         return new Vector3Int(x, y, z);
     }
 
-    /// <summary>
-    /// Given a wrapped key and a reference world position (node centre),
-    /// returns the world-space position closest to the reference — used for
-    /// AABB culling across the wrap boundary.
-    /// </summary>
     private Vector3 ClosestWorldPos(Vector3Int key, Vector3 reference)
     {
         float x = key.x;
         float z = key.z;
 
-        // Shift x by ±worldSizeX if that brings it closer to the reference
         if (Mathf.Abs(x + worldSizeX - reference.x) < Mathf.Abs(x - reference.x)) x += worldSizeX;
         else if (Mathf.Abs(x - worldSizeX - reference.x) < Mathf.Abs(x - reference.x)) x -= worldSizeX;
 

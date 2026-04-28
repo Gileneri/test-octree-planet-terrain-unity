@@ -191,6 +191,19 @@ public struct NodeJob : IJob
         caveNoise.SetFrequency(caveNoiseFrequency > 0f ? caveNoiseFrequency : 0.008f);
         caveNoise.SetNoiseType(FastNoiseLite.NoiseType.OpenSimplex2);
 
+        // Layer 4 — geological border noises, one instance per layer created once here
+        // (not inside SampleDensity, which would re-allocate per voxel)
+        var borderNoises = new NativeArray<FastNoiseLite>(geoLayers.Length, Allocator.Temp);
+        for (int li = 0; li < geoLayers.Length; li++)
+        {
+            var gl = geoLayers[li];
+            var bn = new FastNoiseLite();
+            bn.SetSeed(gl.borderNoiseSeed);
+            bn.SetFrequency(gl.borderNoiseFrequency);
+            bn.SetNoiseType(FastNoiseLite.NoiseType.OpenSimplex2);
+            borderNoises[li] = bn;
+        }
+
         int vi = 0;
         int ii = 0;
 
@@ -204,7 +217,7 @@ public struct NodeJob : IJob
                     float3 wp = new float3(x, y, z) * normalizedVoxelScale
                                 + worldNodePosition - centerOffset;
                     blockIds[x * chunkResolution * chunkResolution + y * chunkResolution + z]
-                        = SampleDensity(wp, ref surfaceNoise, ref caveNoise);
+                        = SampleDensity(wp, ref surfaceNoise, ref caveNoise, borderNoises);
                 }
 
         // Pass 2 — emit faces where a solid voxel borders an Air voxel.
@@ -234,7 +247,7 @@ public struct NodeJob : IJob
                         {
                             float3 wp = new float3(nx, ny, nz) * normalizedVoxelScale
                                         + worldNodePosition - centerOffset;
-                            nbId = SampleDensity(wp, ref surfaceNoise, ref caveNoise);
+                            nbId = SampleDensity(wp, ref surfaceNoise, ref caveNoise, borderNoises);
                         }
 
                         if (nbId != 0) continue; // neighbour is solid — face hidden
@@ -286,6 +299,8 @@ public struct NodeJob : IJob
         uvs.Slice(0, vi).CopyTo(uvSlice);
         blockData.Slice(0, vi).CopyTo(bdSlice);
 
+        borderNoises.Dispose();
+
         MeshingUtility.ApplyMesh(ref meshDataArray,
             ref idxSlice, ref vtxSlice, ref nrmSlice,
             ref uvSlice, ref bdSlice, ref bounds);
@@ -301,11 +316,12 @@ public struct NodeJob : IJob
     /// Used only for out-of-bounds neighbour checks in Pass 2.
     /// </summary>
     private byte SampleDensityLocal(int lx, int ly, int lz,
-        ref FastNoiseLite surfaceNoise, ref FastNoiseLite caveNoise)
+        ref FastNoiseLite surfaceNoise, ref FastNoiseLite caveNoise,
+        NativeArray<FastNoiseLite> borderNoises)
     {
         float3 wp = new float3(lx, ly, lz) * normalizedVoxelScale
                     + worldNodePosition - centerOffset;
-        return SampleDensity(wp, ref surfaceNoise, ref caveNoise);
+        return SampleDensity(wp, ref surfaceNoise, ref caveNoise, borderNoises);
     }
 
     /// <summary>
@@ -322,7 +338,8 @@ public struct NodeJob : IJob
     ///   Layer 4  Geological layers — assigns the correct block id
     /// </summary>
     private byte SampleDensity(float3 wp,
-        ref FastNoiseLite surfaceNoise, ref FastNoiseLite caveNoise)
+        ref FastNoiseLite surfaceNoise, ref FastNoiseLite caveNoise,
+        NativeArray<FastNoiseLite> borderNoises)
     {
         // ── Layer 0 : Floor ────────────────────────────────────────────────
         if (wp.y < minSubsurfaceHeight)
@@ -407,13 +424,9 @@ public struct NodeJob : IJob
             {
                 var layer = geoLayers[i];
 
-                // Sample 2D border noise for this layer's top edge
-                var borderNoise = new FastNoiseLite();
-                borderNoise.SetSeed(layer.borderNoiseSeed);
-                borderNoise.SetFrequency(layer.borderNoiseFrequency);
-                borderNoise.SetNoiseType(FastNoiseLite.NoiseType.OpenSimplex2);
-
-                float borderDisplace = borderNoise.GetNoise(wp.x, wp.z)
+                // Use the pre-created border noise instance for this layer
+                var bn = borderNoises[i];
+                float borderDisplace = bn.GetNoise(wp.x, wp.z)
                                        * layer.borderNoiseAmplitude;
                 float layerTopDepth = layer.baseDepth + borderDisplace;
 

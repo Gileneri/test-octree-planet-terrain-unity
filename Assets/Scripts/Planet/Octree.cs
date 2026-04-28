@@ -63,6 +63,10 @@ public class Octree : MonoBehaviour
     /// </summary>
     [HideInInspector] public int maxColliderDivisions = 2;
 
+    // ── Geological layers ─────────────────────────────────────────────────
+    /// <summary>Blittable layer data forwarded to every NodeJob.</summary>
+    [HideInInspector] public GeologicalLayerBlob[] geoLayerBlobs = new GeologicalLayerBlob[0];
+
     // ── LOD vertical bias ─────────────────────────────────────────────────
     /// <summary>
     /// How much more "expensive" vertical distance is compared to horizontal

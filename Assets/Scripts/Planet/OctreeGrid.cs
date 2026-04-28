@@ -84,12 +84,23 @@ public class OctreeGrid : MonoBehaviour
         "Higher Y = more draw calls and mesh jobs. Increase gradually.")]
     public AnimationCurve lodDistanceCurve = AnimationCurve.Linear(0f, 2f, 1f, 2f);
 
+    [Header("Geological Layers")]
+    [Tooltip("Populated by WorldConfigLoader from WorldConfig.geologicalLayers. Do not edit by hand.")]
+    public GeologicalLayerBlob[] geoLayerBlobs = new GeologicalLayerBlob[0];
+
     [Header("LOD Vertical Bias")]
-  /*  [Tooltip(
-        "How much more expensive vertical distance is for LOD subdivision " +  "1.0 = isotropic (subdivides equally up/down and sideways)
-" + "3.0 = recommended — nodes below/above the player collapse 3× faster
-" + "Higher values reduce underground mesh jobs when on the surface.
-" + "Too high (>5) can cause pop-in when the player descends quickly.")] */
+    /* [Tooltip(
+         "How much more expensive vertical distance is for LOD subdivision.
+
+ " +
+         "1.0 = isotropic (subdivides equally up/down and sideways)
+ " +
+         "3.0 = recommended — nodes below/above the player collapse 3× faster
+
+ " +
+         "Higher values reduce underground mesh jobs when on the surface.
+ " +
+         "Too high (>5) can cause pop-in when the player descends quickly.")] */
     public float verticalLodBias = 3f;
 
     [Header("Render Distance & Performance")]
@@ -301,6 +312,7 @@ public class OctreeGrid : MonoBehaviour
             oct.maxColliderDivisions = _maxColliderDivisions;
             oct.undergroundCullDepth = cellSize * 1.5f;
             oct.verticalLodBias = verticalLodBias;
+            oct.geoLayerBlobs = geoLayerBlobs;
             oct.ForceRebuildTree();
         }
     }
@@ -457,6 +469,7 @@ public class OctreeGrid : MonoBehaviour
         octree.caveNoiseAmplitudeY = caveNoiseAmplitudeY;
         octree.caveSurfaceFadeRange = caveSurfaceFadeRange;
         octree.verticalLodBias = verticalLodBias;
+        octree.geoLayerBlobs = geoLayerBlobs;
         // ───────────────────────────────────────────────────────────────────
         octree.divisions = divisions;
         octree.chunkResolution = chunkResolution;

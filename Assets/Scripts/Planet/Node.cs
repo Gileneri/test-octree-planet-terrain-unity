@@ -22,6 +22,7 @@ public class Node
 
     private NativeArray<int3> modKeys;
     private NativeArray<byte> modValues;
+    private NativeArray<GeologicalLayerBlob> geoLayers;
 
     // -----------------------------------------------------------------------
 
@@ -75,6 +76,7 @@ public class Node
     {
         if (modKeys.IsCreated) modKeys.Dispose();
         if (modValues.IsCreated) modValues.Dispose();
+        if (geoLayers.IsCreated) geoLayers.Dispose();
         GameObject.Destroy(gameObject);
     }
 
@@ -101,6 +103,7 @@ public class Node
         var nodePos = NodePosition();
 
         BuildModificationArrays(nodePos, NodeScale(), out modKeys, out modValues);
+        BuildGeoLayersArray(out geoLayers);
 
         var job = new NodeJob
         {
@@ -125,6 +128,7 @@ public class Node
             worldNodePosition = nodePos,
             modKeys = modKeys,
             modValues = modValues,
+            geoLayers = geoLayers,
         };
 
         // Mark as in-flight so we don't double-collect this frame
@@ -151,6 +155,7 @@ public class Node
                 isScheduled = false;
                 if (modKeys.IsCreated) modKeys.Dispose();
                 if (modValues.IsCreated) modValues.Dispose();
+                if (geoLayers.IsCreated) geoLayers.Dispose();
             },
 
             // cancel — budget dropped this job; free resources and reset so
@@ -160,6 +165,7 @@ public class Node
                 meshDataArray.Dispose();
                 if (modKeys.IsCreated) modKeys.Dispose();
                 if (modValues.IsCreated) modValues.Dispose();
+                if (geoLayers.IsCreated) geoLayers.Dispose();
                 isScheduled = false;
                 needsDrawn = true;   // will be re-collected next frame
             }
@@ -191,6 +197,23 @@ public class Node
             keys[i] = new int3(kArr[i].x, kArr[i].y, kArr[i].z);
             values[i] = (byte)vArr[i];
         }
+    }
+
+    // -----------------------------------------------------------------------
+
+    private void BuildGeoLayersArray(out NativeArray<GeologicalLayerBlob> layers)
+    {
+        var blobs = octree.geoLayerBlobs;
+        if (blobs == null || blobs.Length == 0)
+        {
+            layers = new NativeArray<GeologicalLayerBlob>(0, Allocator.Persistent);
+            return;
+        }
+
+        layers = new NativeArray<GeologicalLayerBlob>(
+            blobs.Length, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
+        for (int i = 0; i < blobs.Length; i++)
+            layers[i] = blobs[i];
     }
 
     // -----------------------------------------------------------------------

@@ -1,0 +1,21 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 5ec69e6dd7272f24db8fd6f1d34f3ebd, type: 3}
+  m_Name: BlockRegistry
+  m_EditorClassIdentifier: Assembly-CSharp::BlockRegistry
+  blocks:
+  - {fileID: 11400000, guid: 1542440dcb398cb43be9957ac6af8deb, type: 2}
+  - {fileID: 11400000, guid: 3a98d30025a3c474690cc74f511a1875, type: 2}
+  - {fileID: 11400000, guid: fb1510bcb0a35bf4fbaf101eac9f3b2c, type: 2}
+  - {fileID: 11400000, guid: b9789a461544d2c46a4eff59ced6aa78, type: 2}
+  textureArray: {fileID: 18700000, guid: 40b94448e33037f44bc331324148fd1d, type: 2}
+  textureSize: 16

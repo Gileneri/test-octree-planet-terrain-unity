@@ -90,6 +90,11 @@ public class WorldConfigLoader : MonoBehaviour
         grid.chunkResolution = config.chunkResolution;
         grid.renderRadius = config.renderRadius;
 
+        // Convert GeologicalLayerConfig to blobs for the job pipeline
+        grid.geoLayerBlobs = (config.geologicalLayers != null)
+            ? config.geologicalLayers.ToBlobs()
+            : new GeologicalLayerBlob[0];
+
         // Also push floor to WorldModifications so digs below the floor are
         // rejected at the data layer before they are even recorded
         if (WorldModifications.Instance != null)

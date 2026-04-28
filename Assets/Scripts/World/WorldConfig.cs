@@ -112,6 +112,14 @@ public class WorldConfig : ScriptableObject
     public float caveSurfaceFadeRange = 20f;
 
     // ------------------------------------------------------------------
+    // Geological Layers
+    // ------------------------------------------------------------------
+
+    [Header("Geological Layers")]
+    [Tooltip("Assign a GeologicalLayerConfig asset. Leave null for uniform solid terrain (blockId 1).")]
+    public GeologicalLayerConfig geologicalLayers;
+
+    // ------------------------------------------------------------------
     // Render
     // ------------------------------------------------------------------
 

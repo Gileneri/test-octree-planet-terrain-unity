@@ -72,6 +72,14 @@ public struct NodeJob : IJob
     public float caveNoiseAmplitudeY;   // vertical squish, typical 0.3–0.6
     public float caveSurfaceFadeRange;  // Y units below surface where caves fade in
 
+    // ── Layer 4 : Geological layers ──────────────────────────────────────
+    /// <summary>
+    /// Ordered array of geological layers, shallowest first.
+    /// Prepared on the main thread from GeologicalLayerConfig.ToBlobs().
+    /// Empty array = uniform Stone (blockId 1) underground.
+    /// </summary>
+    [ReadOnly] public NativeArray<GeologicalLayerBlob> geoLayers;
+
     // ── Chunk ─────────────────────────────────────────────────────────────
     public int chunkResolution;
     public float nodeScale;
@@ -85,6 +93,16 @@ public struct NodeJob : IJob
     // Used for the two node-level early exits.
     private float nodeMinY;   // world Y of the node's bottom face
     private float nodeMaxY;   // world Y of the node's top face
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  UV layout per face side
+    //  Matches BuildOrder winding: BL, BR, TL, TR
+    // ═══════════════════════════════════════════════════════════════════════
+    // UV corners in the same winding order as Tables.BuildOrder quads
+    static readonly float2 UV0 = new float2(0f, 0f); // bottom-left
+    static readonly float2 UV1 = new float2(1f, 0f); // bottom-right
+    static readonly float2 UV2 = new float2(0f, 1f); // top-left
+    static readonly float2 UV3 = new float2(1f, 1f); // top-right
 
     // ═══════════════════════════════════════════════════════════════════════
     //  Main-thread helper
@@ -113,10 +131,16 @@ public struct NodeJob : IJob
         var indices = new NativeArray<uint>(maxIdx, Allocator.Temp, NativeArrayOptions.UninitializedMemory);
         var vertices = new NativeArray<float3>(maxVerts, Allocator.Temp, NativeArrayOptions.UninitializedMemory);
         var normals = new NativeArray<float3>(maxVerts, Allocator.Temp, NativeArrayOptions.UninitializedMemory);
+        var uvs = new NativeArray<float2>(maxVerts, Allocator.Temp, NativeArrayOptions.UninitializedMemory);
+        var blockData = new NativeArray<float2>(maxVerts, Allocator.Temp, NativeArrayOptions.UninitializedMemory);
+        // blockIds per voxel — used for face culling and (later) greedy meshing
+        var blockIds = new NativeArray<byte>(chunkResolution * chunkResolution * chunkResolution,
+            Allocator.Temp, NativeArrayOptions.ClearMemory); // 0 = Air by default
 
         // Zero-length arrays reused by node-level early exits
         var emptyUint = new NativeArray<uint>(0, Allocator.Temp);
         var emptyFloat3 = new NativeArray<float3>(0, Allocator.Temp);
+        var emptyFloat2 = new NativeArray<float2>(0, Allocator.Temp);
 
         centerOffset = new float3(1f, 1f, 1f) * (nodeScale * 0.5f);
         normalizedVoxelScale = nodeScale / chunkResolution;
@@ -133,7 +157,8 @@ public struct NodeJob : IJob
         if (nodeMaxY < minSubsurfaceHeight)
         {
             MeshingUtility.ApplyMesh(ref meshDataArray,
-                ref emptyUint, ref emptyFloat3, ref emptyFloat3, ref bounds);
+                ref emptyUint, ref emptyFloat3, ref emptyFloat3,
+                ref emptyFloat2, ref emptyFloat2, ref bounds);
             return;
         }
 
@@ -144,7 +169,8 @@ public struct NodeJob : IJob
         if (nodeMinY > surfaceBaseHeight + surfaceNoiseAmplitude)
         {
             MeshingUtility.ApplyMesh(ref meshDataArray,
-                ref emptyUint, ref emptyFloat3, ref emptyFloat3, ref bounds);
+                ref emptyUint, ref emptyFloat3, ref emptyFloat3,
+                ref emptyFloat2, ref emptyFloat2, ref bounds);
             return;
         }
 
@@ -168,18 +194,50 @@ public struct NodeJob : IJob
         int vi = 0;
         int ii = 0;
 
+        // Pass 1 — evaluate density for every voxel and cache blockIds.
+        // This separates density evaluation from meshing so each voxel's
+        // density is computed exactly once (not once per face check).
         for (int x = 0; x < chunkResolution; x++)
             for (int y = 0; y < chunkResolution; y++)
                 for (int z = 0; z < chunkResolution; z++)
                 {
-                    if (IsAir(x, y, z, ref surfaceNoise, ref caveNoise)) continue;
+                    float3 wp = new float3(x, y, z) * normalizedVoxelScale
+                                + worldNodePosition - centerOffset;
+                    blockIds[x * chunkResolution * chunkResolution + y * chunkResolution + z]
+                        = SampleDensity(wp, ref surfaceNoise, ref caveNoise);
+                }
+
+        // Pass 2 — emit faces where a solid voxel borders an Air voxel.
+        for (int x = 0; x < chunkResolution; x++)
+            for (int y = 0; y < chunkResolution; y++)
+                for (int z = 0; z < chunkResolution; z++)
+                {
+                    byte bid = blockIds[x * chunkResolution * chunkResolution + y * chunkResolution + z];
+                    if (bid == 0) continue; // Air
 
                     float3 localPos = new float3(x, y, z) * normalizedVoxelScale - centerOffset;
 
                     for (int side = 0; side < 6; side++)
                     {
                         int3 nb = Tables.NeighborOffset[side];
-                        if (!IsAir(x + nb.x, y + nb.y, z + nb.z, ref surfaceNoise, ref caveNoise)) continue;
+                        int nx = x + nb.x, ny = y + nb.y, nz = z + nb.z;
+
+                        // Neighbour blockId — sample cache if in bounds, else query density
+                        byte nbId;
+                        if (nx >= 0 && nx < chunkResolution &&
+                            ny >= 0 && ny < chunkResolution &&
+                            nz >= 0 && nz < chunkResolution)
+                        {
+                            nbId = blockIds[nx * chunkResolution * chunkResolution + ny * chunkResolution + nz];
+                        }
+                        else
+                        {
+                            float3 wp = new float3(nx, ny, nz) * normalizedVoxelScale
+                                        + worldNodePosition - centerOffset;
+                            nbId = SampleDensity(wp, ref surfaceNoise, ref caveNoise);
+                        }
+
+                        if (nbId != 0) continue; // neighbour is solid — face hidden
 
                         vertices[vi + 0] = Tables.Vertices[Tables.BuildOrder[side][0]] * normalizedVoxelScale + localPos;
                         vertices[vi + 1] = Tables.Vertices[Tables.BuildOrder[side][1]] * normalizedVoxelScale + localPos;
@@ -187,6 +245,23 @@ public struct NodeJob : IJob
                         vertices[vi + 3] = Tables.Vertices[Tables.BuildOrder[side][3]] * normalizedVoxelScale + localPos;
 
                         normals[vi + 0] = normals[vi + 1] = normals[vi + 2] = normals[vi + 3] = Tables.Normals[side];
+
+                        // UVs — standard quad winding BL BR TL TR
+                        uvs[vi + 0] = UV0;
+                        uvs[vi + 1] = UV1;
+                        uvs[vi + 2] = UV2;
+                        uvs[vi + 3] = UV3;
+
+                        // blockData: x = blockId (float), y = tex array layer for this face side
+                        // layer = blockId * 3 + faceSlot (0=top, 1=bottom, 2=side)
+                        // Tables.Normals: 0=right 1=left 2=up 3=down 4=front 5=back
+                        int faceSlot = side == 2 ? 0 : (side == 3 ? 1 : 2);
+                        float texLayer = bid * 3 + faceSlot;
+                        var bd = new float2((float)bid, texLayer);
+                        blockData[vi + 0] = bd;
+                        blockData[vi + 1] = bd;
+                        blockData[vi + 2] = bd;
+                        blockData[vi + 3] = bd;
 
                         indices[ii + 0] = (uint)(vi + 0);
                         indices[ii + 1] = (uint)(vi + 1);
@@ -203,18 +278,29 @@ public struct NodeJob : IJob
         var idxSlice = new NativeArray<uint>(ii, Allocator.Temp, NativeArrayOptions.UninitializedMemory);
         var vtxSlice = new NativeArray<float3>(vi, Allocator.Temp, NativeArrayOptions.UninitializedMemory);
         var nrmSlice = new NativeArray<float3>(vi, Allocator.Temp, NativeArrayOptions.UninitializedMemory);
+        var uvSlice = new NativeArray<float2>(vi, Allocator.Temp, NativeArrayOptions.UninitializedMemory);
+        var bdSlice = new NativeArray<float2>(vi, Allocator.Temp, NativeArrayOptions.UninitializedMemory);
         indices.Slice(0, ii).CopyTo(idxSlice);
         vertices.Slice(0, vi).CopyTo(vtxSlice);
         normals.Slice(0, vi).CopyTo(nrmSlice);
+        uvs.Slice(0, vi).CopyTo(uvSlice);
+        blockData.Slice(0, vi).CopyTo(bdSlice);
 
-        MeshingUtility.ApplyMesh(ref meshDataArray, ref idxSlice, ref vtxSlice, ref nrmSlice, ref bounds);
+        MeshingUtility.ApplyMesh(ref meshDataArray,
+            ref idxSlice, ref vtxSlice, ref nrmSlice,
+            ref uvSlice, ref bdSlice, ref bounds);
     }
 
     // ═══════════════════════════════════════════════════════════════════════
     //  Density pipeline
     // ═══════════════════════════════════════════════════════════════════════
 
-    private bool IsAir(int lx, int ly, int lz,
+    /// <summary>
+    /// Returns blockId for a voxel at local chunk coords.
+    /// 0 = Air. Reads from the blockIds cache (Pass 1 must have run first).
+    /// Used only for out-of-bounds neighbour checks in Pass 2.
+    /// </summary>
+    private byte SampleDensityLocal(int lx, int ly, int lz,
         ref FastNoiseLite surfaceNoise, ref FastNoiseLite caveNoise)
     {
         float3 wp = new float3(lx, ly, lz) * normalizedVoxelScale
@@ -223,15 +309,24 @@ public struct NodeJob : IJob
     }
 
     /// <summary>
-    /// Returns true = Air, false = Solid.
-    /// Layers are evaluated top to bottom; the first definitive answer wins.
+    /// Core density function. Returns blockId (byte):
+    ///   0          = Air
+    ///   1          = generic Solid (fallback when no layers defined)
+    ///   2, 3, 4… = geological layer block ids
+    ///
+    /// Pipeline (top = highest priority):
+    ///   Layer 0  Floor            — below minSubsurfaceHeight → Solid (id 1)
+    ///   Layer 1  Player mods      — explicit Air/Solid overrides
+    ///   Layer 2  Procedural surface — above surfaceY → Air
+    ///   Layer 3  Caves            — underground noise carving → Air
+    ///   Layer 4  Geological layers — assigns the correct block id
     /// </summary>
-    private bool SampleDensity(float3 wp,
+    private byte SampleDensity(float3 wp,
         ref FastNoiseLite surfaceNoise, ref FastNoiseLite caveNoise)
     {
         // ── Layer 0 : Floor ────────────────────────────────────────────────
         if (wp.y < minSubsurfaceHeight)
-            return false; // Solid — unconditional, nothing overrides
+            return SolidId(wp); // unconditional solid
 
         // ── Layer 1 : Player modifications ────────────────────────────────
         int3 key = new int3(
@@ -246,33 +341,24 @@ public struct NodeJob : IJob
                 modKeys[i].y == key.y &&
                 modKeys[i].z == key.z)
             {
-                return modValues[i] == 1; // 1 = Air, 0 = Solid
+                return modValues[i] == 1 ? (byte)0 : SolidId(wp);
             }
         }
 
         // ── Layer 2 : Procedural surface ──────────────────────────────────
-
-        // Cheap Y early-exit BEFORE the expensive toroidal cos/sin sampling.
-        // If the voxel is above the maximum possible surface height it is
-        // always Air. If it is below the minimum possible surface height it
-        // is always Solid (unless caves or mods override — handled above).
         float maxSurface = surfaceBaseHeight + surfaceNoiseAmplitude;
         float minSurface = surfaceBaseHeight - surfaceNoiseAmplitude;
 
         if (wp.y > maxSurface)
-            return true;  // Air — definitely above any terrain
+            return 0; // Air — definitely above terrain
 
-        // Compute actual surface height only when the voxel Y is ambiguous
-        // (could be either side of the real surface).
         float surfaceY;
         if (wp.y < minSurface)
         {
-            // Definitely below the surface — skip noise entirely.
-            surfaceY = maxSurface; // any value > wp.y suffices; use worst-case
+            surfaceY = maxSurface; // definitely below — skip noise
         }
         else
         {
-            // Voxel is in the "could go either way" band — must sample noise.
             float wx = PosMod(wp.x, worldSizeX);
             float wz = PosMod(wp.z, worldSizeZ);
 
@@ -294,26 +380,88 @@ public struct NodeJob : IJob
         }
 
         if (wp.y > surfaceY)
-            return true; // Air — above surface
+            return 0; // Air — above surface
 
-        // ── Layer 3 : Procedural caves ────────────────────────────────────
-        if (!cavesEnabled)
-            return false; // Solid — underground, caves disabled
+        // ── Layer 3 : Caves ────────────────────────────────────────────────
+        if (cavesEnabled)
+        {
+            float depthBelowSurface = surfaceY - wp.y;
+            float fade = caveSurfaceFadeRange > 0f
+                ? math.saturate(depthBelowSurface / caveSurfaceFadeRange)
+                : 1f;
 
-        // Fade caves out near the surface so they never punch a hole through
-        float depthBelowSurface = surfaceY - wp.y;
-        float fade = caveSurfaceFadeRange > 0f
-            ? math.saturate(depthBelowSurface / caveSurfaceFadeRange)
-            : 1f;
+            float cn = caveNoise.GetNoise(wp.x, wp.y * caveNoiseAmplitudeY, wp.z);
+            float effectiveThreshold = math.lerp(1f, caveNoiseThreshold, fade);
 
-        // Y squished so caves are tunnel-shaped rather than spherical
-        float cn = caveNoise.GetNoise(wp.x, wp.y * caveNoiseAmplitudeY, wp.z);
+            if (cn > effectiveThreshold)
+                return 0; // Air — inside a cave
+        }
 
-        // At fade=0 (surface) the threshold is 1.0 (impossible to be air → solid)
-        // At fade=1 (deep)    the threshold is caveNoiseThreshold
-        float effectiveThreshold = math.lerp(1f, caveNoiseThreshold, fade);
+        // ── Layer 4 : Geological layers ────────────────────────────────────
+        // Walk layers top-to-bottom and find which one owns this voxel.
+        if (geoLayers.Length > 0)
+        {
+            float depth = surfaceY - wp.y; // depth below local surface
 
-        return cn > effectiveThreshold; // Air = inside a cave tunnel
+            for (int i = 0; i < geoLayers.Length; i++)
+            {
+                var layer = geoLayers[i];
+
+                // Sample 2D border noise for this layer's top edge
+                var borderNoise = new FastNoiseLite();
+                borderNoise.SetSeed(layer.borderNoiseSeed);
+                borderNoise.SetFrequency(layer.borderNoiseFrequency);
+                borderNoise.SetNoiseType(FastNoiseLite.NoiseType.OpenSimplex2);
+
+                float borderDisplace = borderNoise.GetNoise(wp.x, wp.z)
+                                       * layer.borderNoiseAmplitude;
+                float layerTopDepth = layer.baseDepth + borderDisplace;
+
+                if (depth < layerTopDepth)
+                {
+                    // Above this layer's (displaced) top — belongs to previous layer
+                    // (or layer 0 if this is the first layer)
+                    if (i == 0) return 1; // fallback solid before first layer
+                    return geoLayers[i - 1].blockId;
+                }
+
+                // Last layer — everything below goes here (bedrock)
+                if (i == geoLayers.Length - 1)
+                    return layer.blockId;
+            }
+        }
+
+        // Fallback: no layers defined → generic solid (id 1)
+        return 1;
+    }
+
+    /// <summary>
+    /// Returns the solid block id at wp using geological layers,
+    /// without re-evaluating Air/cave conditions.
+    /// Used by Layer 0 (floor) and Layer 1 (solid mod).
+    /// </summary>
+    private byte SolidId(float3 wp)
+    {
+        if (geoLayers.Length == 0) return 1;
+
+        // Use the last (deepest / bedrock) layer as the guaranteed solid
+        // for anything below the surface or forced solid by mods.
+        // A more accurate version would re-run the layer walk — but for
+        // floor/mod cases the exact layer matters less than returning non-zero.
+        float surfaceApprox = surfaceBaseHeight;
+        float depth = surfaceApprox - wp.y;
+
+        for (int i = 0; i < geoLayers.Length; i++)
+        {
+            var layer = geoLayers[i];
+            if (depth < layer.baseDepth + layer.borderNoiseAmplitude) // rough check
+            {
+                if (i == 0) return 1;
+                return geoLayers[i - 1].blockId;
+            }
+            if (i == geoLayers.Length - 1) return layer.blockId;
+        }
+        return 1;
     }
 
     // ═══════════════════════════════════════════════════════════════════════

@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using System.Diagnostics;
 using UnityEngine;
 using Unity.Collections;
 using Unity.Jobs;
@@ -110,11 +111,49 @@ public class OctreeGrid : MonoBehaviour
     [Tooltip("Max chunk mesh jobs completed per frame across ALL cells.")]
     public int maxJobsPerFrame = 120;
 
+    [Tooltip("Target main-thread budget for mesh completion (ms).")]
+    public float targetMeshingBudgetMs = 4.0f;
+
+    [Tooltip("Lower bound of jobs completed per frame.")]
+    public int minJobsPerFrame = 2;
+
     [Tooltip("New octree cells activated per frame when player moves.")]
     public int newCellsPerFrame = 3;
 
     [Tooltip("Max octree node subdivisions per cell per frame.")]
     public int maxNodeCreationsPerFrame = 50;
+
+    [Header("Underground Culling")]
+    [Tooltip("Enable hard node-level culling below a fixed underground altitude.")]
+    public bool enableUndergroundNodeCull = false;
+
+    [Tooltip("Safety margin below the planet's lowest possible surface before underground chunks are culled.")]
+    public float undergroundSolidCullMargin = 10f;
+
+    [Tooltip("Hide underground faces that border enclosed air pockets.")]
+    public bool cullEnclosedUndergroundFaces = true;
+
+    [Tooltip("Only hide enclosed faces this far below local surface (safety margin).")]
+    public float enclosedUndergroundFaceMargin = 2f;
+
+    [Header("Coarse LOD Underground Face Culling")]
+    [Tooltip("Use true surface-shell approximation on coarse LODs (ignores underground caves on distant meshes).")]
+    public bool useSurfaceShellOnCoarseLod = true;
+
+    [Tooltip("Apply surface-shell approximation only on nodes with divisions >= this value.")]
+    public int surfaceShellMinDivisions = 4;
+
+    [Tooltip("On coarse LOD nodes, hide underground faces below local surface (surface shell approximation).")]
+    public bool cullUndergroundFacesOnCoarseLod = false;
+
+    [Tooltip("Apply coarse underground face culling only on nodes with divisions >= this value.")]
+    public int coarseLodFaceCullMinDivisions = 4;
+
+    [Tooltip("Safety margin below local surface for coarse LOD face culling.")]
+    public float coarseLodFaceCullMargin = 1.5f;
+
+    [Tooltip("Minimum top surface voxel layers preserved per XZ column on coarse LODs.")]
+    public int coarseLodMinSurfaceVoxels = 2;
 
     [Header("Predictive Loading")]
     [Tooltip("Extra cells to pre-load ahead in the movement direction. 0 = off.")]
@@ -151,6 +190,12 @@ public class OctreeGrid : MonoBehaviour
 
     // Frustum planes extracted once per frame and shared with all octrees
     private Plane[] frustumPlanes;
+    private readonly Stopwatch _meshingStopwatch = new Stopwatch();
+    private int _dynamicJobsPerFrame;
+    private float _emaJobCostMs = 0f;
+    private const float SpikeCutoffMultiplier = 1.75f;
+    private const float SpikeBudgetDropFactor = 0.6f;
+    private float _undergroundCullBelowY;
 
     // -----------------------------------------------------------------------
 
@@ -178,13 +223,15 @@ public class OctreeGrid : MonoBehaviour
         BakeLodRadii();
         ComputeMaxColliderDivisions();
 
-        Debug.Log($"[OctreeGrid] cellSize={cellSize}  renderRadius={renderRadius}  " +
+        UnityEngine.Debug.Log($"[OctreeGrid] cellSize={cellSize}  renderRadius={renderRadius}  " +
                   $"grid={(renderRadius * 2 + 1)}×{(renderRadius * 2 + 1)}  " +
                   $"world={worldSizeX}×{worldSizeZ}  " +
                   $"seed={noiseSeed}  noiseTypeId={noiseTypeId}  " +
                   $"minSubY={minSubsurfaceHeight}");
 
         prevPlayerPos = priority.position;
+        _dynamicJobsPerFrame = Mathf.Max(1, maxJobsPerFrame);
+        RecomputeUndergroundCullBelowY();
 
         EnqueueDesiredCells(WorldToCell(priority.position));
         ProcessPendingCells(int.MaxValue);
@@ -219,20 +266,24 @@ public class OctreeGrid : MonoBehaviour
             ? GeometryUtility.CalculateFrustumPlanes(playerCamera)
             : null;
 
+        RecomputeUndergroundCullBelowY();
+
         foreach (var octree in activeCells.Values)
-            octree.Tick(frameJobs, priority.position, frustumPlanes);
+            octree.Tick(frameJobs, priority.position, frustumPlanes, _undergroundCullBelowY);
     }
 
     private void LateUpdate()
     {
         if (frameJobs.Count == 0) return;
 
-        var sw = new System.Diagnostics.Stopwatch();
-        sw.Start();
+        _meshingStopwatch.Restart();
 
         frameJobs.Sort((a, b) => a.sqrDistToPlayer.CompareTo(b.sqrDistToPlayer));
 
-        int count = Mathf.Min(frameJobs.Count, maxJobsPerFrame);
+        int clampedMinJobs = Mathf.Clamp(minJobsPerFrame, 1, Mathf.Max(1, maxJobsPerFrame));
+        int clampedMaxJobs = Mathf.Max(clampedMinJobs, maxJobsPerFrame);
+        int jobBudget = Mathf.Clamp(_dynamicJobsPerFrame, clampedMinJobs, clampedMaxJobs);
+        int count = Mathf.Min(frameJobs.Count, jobBudget);
 
         var handles = new NativeArray<JobHandle>(count, Allocator.Temp);
         for (int i = 0; i < count; i++)
@@ -248,9 +299,30 @@ public class OctreeGrid : MonoBehaviour
 
         frameJobs.Clear();
 
-        sw.Stop();
-        if (sw.ElapsedMilliseconds > 5)
-            Debug.Log($"[OctreeGrid] meshing {sw.ElapsedMilliseconds} ms  jobs={count}");
+        _meshingStopwatch.Stop();
+        float frameMeshingMs = (float)_meshingStopwatch.Elapsed.TotalMilliseconds;
+        if (count > 0)
+        {
+            float jobCostMs = frameMeshingMs / count;
+            _emaJobCostMs = _emaJobCostMs <= 0f ? jobCostMs : Mathf.Lerp(_emaJobCostMs, jobCostMs, 0.2f);
+
+            if (_emaJobCostMs > 0f)
+            {
+                int nextBudget = Mathf.FloorToInt(targetMeshingBudgetMs / _emaJobCostMs);
+                _dynamicJobsPerFrame = Mathf.Clamp(nextBudget, clampedMinJobs, clampedMaxJobs);
+            }
+        }
+
+        // React immediately to spikes (EMA alone reacts too slowly).
+        float spikeCutoffMs = Mathf.Max(1f, targetMeshingBudgetMs) * SpikeCutoffMultiplier;
+        if (frameMeshingMs > spikeCutoffMs && jobBudget > clampedMinJobs)
+        {
+            int droppedBudget = Mathf.FloorToInt(jobBudget * SpikeBudgetDropFactor);
+            _dynamicJobsPerFrame = Mathf.Clamp(droppedBudget, clampedMinJobs, clampedMaxJobs);
+        }
+
+        if (_meshingStopwatch.ElapsedMilliseconds > 5)
+            UnityEngine.Debug.Log($"[OctreeGrid] meshing {_meshingStopwatch.ElapsedMilliseconds} ms  jobs={count}  budget={jobBudget}  next={_dynamicJobsPerFrame}");
     }
 
     private void OnDestroy()
@@ -265,6 +337,11 @@ public class OctreeGrid : MonoBehaviour
     {
         GUILayout.Label($"World: {worldSizeX} × {worldSizeZ} units  (toroidal)");
         GUILayout.Label($"Active cells: {activeCells.Count}  Pending: {pendingCells.Count}  Jobs: {frameJobs.Count}");
+        GUILayout.Label($"Meshing budget: current={_dynamicJobsPerFrame} targetMs={targetMeshingBudgetMs:F1} avgJobMs={_emaJobCostMs:F2}");
+        GUILayout.Label($"Underground node cull: {(enableUndergroundNodeCull ? $"ON belowY={_undergroundCullBelowY:F1}" : "OFF")}");
+        GUILayout.Label($"Enclosed underground faces: {(cullEnclosedUndergroundFaces ? $"ON margin={enclosedUndergroundFaceMargin:F1}" : "OFF")}");
+        GUILayout.Label($"Surface shell coarse: {(useSurfaceShellOnCoarseLod ? $"ON minDiv={surfaceShellMinDivisions}" : "OFF")}");
+        GUILayout.Label($"Coarse underground faces: {(cullUndergroundFacesOnCoarseLod ? $"ON minDiv={coarseLodFaceCullMinDivisions} margin={coarseLodFaceCullMargin:F1} minSurfaceVox={coarseLodMinSurfaceVoxels}" : "OFF")}");
         GUILayout.Label($"Player: {priority.position}");
         GUILayout.Label($"Speed: {playerVelocity.magnitude:F1} u/s  " +
                         $"Prediction: {(playerVelocity.magnitude > predictionSpeedThreshold ? "ON" : "off")}");
@@ -310,7 +387,15 @@ public class OctreeGrid : MonoBehaviour
         {
             oct.lodRadii = lodRadii;
             oct.maxColliderDivisions = _maxColliderDivisions;
-            oct.undergroundCullDepth = cellSize * 1.5f;
+            oct.undergroundCullBelowY = _undergroundCullBelowY;
+            oct.cullEnclosedUndergroundFaces = cullEnclosedUndergroundFaces;
+            oct.enclosedUndergroundFaceMargin = enclosedUndergroundFaceMargin;
+            oct.useSurfaceShellOnCoarseLod = useSurfaceShellOnCoarseLod;
+            oct.surfaceShellMinDivisions = surfaceShellMinDivisions;
+            oct.cullUndergroundFacesOnCoarseLod = cullUndergroundFacesOnCoarseLod;
+            oct.coarseLodFaceCullMinDivisions = coarseLodFaceCullMinDivisions;
+            oct.coarseLodFaceCullMargin = coarseLodFaceCullMargin;
+            oct.coarseLodMinSurfaceVoxels = coarseLodMinSurfaceVoxels;
             oct.verticalLodBias = verticalLodBias;
             oct.geoLayerBlobs = geoLayerBlobs;
             oct.ForceRebuildTree();
@@ -341,7 +426,7 @@ public class OctreeGrid : MonoBehaviour
             else break;
         }
         _maxColliderDivisions = maxDiv;
-        Debug.Log($"[OctreeGrid] maxColliderDivisions={_maxColliderDivisions} " +
+        UnityEngine.Debug.Log($"[OctreeGrid] maxColliderDivisions={_maxColliderDivisions} " +
                   $"(voxelSize at that level = {Mathf.Pow(2f, _maxColliderDivisions - 1):F0}u)");
     }
 
@@ -365,7 +450,7 @@ public class OctreeGrid : MonoBehaviour
         var sb = new System.Text.StringBuilder("[OctreeGrid] LOD radii:\n");
         for (int i = 0; i < lodRadii.Length; i++)
             sb.AppendLine($"  level {i} (nodeSize={chunkResolution * Mathf.Pow(2f, i):F0}): radius={lodRadii[i]:F0} units");
-        Debug.Log(sb.ToString());
+        UnityEngine.Debug.Log(sb.ToString());
     }
 
     // -----------------------------------------------------------------------
@@ -478,11 +563,31 @@ public class OctreeGrid : MonoBehaviour
         octree.chunkPrefab = chunkPrefab;
         octree.cellOrigin = CellToWorld(cell);
         octree.maxColliderDivisions = _maxColliderDivisions;
-        octree.undergroundCullDepth = cellSize * 1.5f;
+        octree.undergroundCullBelowY = _undergroundCullBelowY;
+        octree.cullEnclosedUndergroundFaces = cullEnclosedUndergroundFaces;
+        octree.enclosedUndergroundFaceMargin = enclosedUndergroundFaceMargin;
+        octree.useSurfaceShellOnCoarseLod = useSurfaceShellOnCoarseLod;
+        octree.surfaceShellMinDivisions = surfaceShellMinDivisions;
+        octree.cullUndergroundFacesOnCoarseLod = cullUndergroundFacesOnCoarseLod;
+        octree.coarseLodFaceCullMinDivisions = coarseLodFaceCullMinDivisions;
+        octree.coarseLodFaceCullMargin = coarseLodFaceCullMargin;
+        octree.coarseLodMinSurfaceVoxels = coarseLodMinSurfaceVoxels;
         octree.lodRadii = lodRadii;   // share the baked array — read-only at runtime
 
         octree.Initialize();
         return octree;
+    }
+
+    private void RecomputeUndergroundCullBelowY()
+    {
+        if (!enableUndergroundNodeCull)
+        {
+            _undergroundCullBelowY = float.NegativeInfinity;
+            return;
+        }
+
+        float lowestPossibleSurfaceY = surfaceBaseHeight - Mathf.Abs(surfaceNoiseAmplitude);
+        _undergroundCullBelowY = lowestPossibleSurfaceY - Mathf.Max(0f, undergroundSolidCullMargin);
     }
 
     // -----------------------------------------------------------------------

@@ -85,20 +85,18 @@ public class Octree : MonoBehaviour
 
     // ── Underground culling ───────────────────────────────────────────────
     /// <summary>
-    /// Player Y position, updated every frame by OctreeGrid.
-    /// CollectJobs skips nodes whose entire AABB sits more than
-    /// undergroundCullDepth below the player — they are not visible
-    /// regardless of caves, frustum, or any other condition.
+    /// Absolute world-space Y threshold used by CollectJobs.
+    /// Nodes whose top is below this value are skipped.
     /// </summary>
-    [HideInInspector] public float playerY = 0f;
-
-    /// <summary>
-    /// How many units below the player underground nodes are still meshed.
-    /// Set by OctreeGrid to 1.5 × cellSize so the player always has one
-    /// full cell of geometry below them plus a buffer.
-    /// Increase if you want deeper caves to pre-load.
-    /// </summary>
-    [HideInInspector] public float undergroundCullDepth = 2048f;
+    [HideInInspector] public float undergroundCullBelowY = float.NegativeInfinity;
+    [HideInInspector] public bool cullEnclosedUndergroundFaces = true;
+    [HideInInspector] public float enclosedUndergroundFaceMargin = 2f;
+    [HideInInspector] public bool useSurfaceShellOnCoarseLod = true;
+    [HideInInspector] public int surfaceShellMinDivisions = 4;
+    [HideInInspector] public bool cullUndergroundFacesOnCoarseLod = true;
+    [HideInInspector] public int coarseLodFaceCullMinDivisions = 4;
+    [HideInInspector] public float coarseLodFaceCullMargin = 1.5f;
+    [HideInInspector] public int coarseLodMinSurfaceVoxels = 2;
     // ─────────────────────────────────────────────────────────────────────
 
     [HideInInspector] public Node root;
@@ -119,11 +117,15 @@ public class Octree : MonoBehaviour
         initialised = true;
     }
 
-    public void Tick(List<OctreeGrid.PrioritizedJob> jobList, Vector3 playerPos, Plane[] planes)
+    public void Tick(
+        List<OctreeGrid.PrioritizedJob> jobList,
+        Vector3 playerPos,
+        Plane[] planes,
+        float cullBelowY)
     {
         if (!initialised) return;
         frustumPlanes = planes;
-        playerY = playerPos.y;
+        undergroundCullBelowY = cullBelowY;
         int creations = 0;
         Traverse(root, playerPos, ref creations);
         CollectJobs(root, jobList, playerPos);
@@ -258,17 +260,15 @@ public class Octree : MonoBehaviour
         // Skip entire subtree when AABB is fully outside camera frustum.
         if (frustumPlanes != null && !IsAabbInFrustum(node)) return;
 
-        // ── Underground depth culling ─────────────────────────────────────
-        // Skip nodes whose entire AABB sits more than undergroundCullDepth
-        // below the player. Works with caves on or off — a node 5 cells
-        // below the player is not visible regardless of cave topology.
-        // Traverse is unaffected, so nodes mesh immediately when the player
-        // descends into range.
+        // ── Underground culling below guaranteed-surface threshold ───────
+        // Skip nodes completely below the configured cull altitude.
+        // This avoids meshing deep underground volumes that are enclosed by
+        // solid terrain and cannot be seen from outside the planet.
         {
             Vector3 nodeCenter = node.NodePosition();
             float nodeHalfY = node.NodeScale() * 0.5f;
             float nodeTopY = nodeCenter.y + nodeHalfY;
-            if (nodeTopY < playerY - undergroundCullDepth)
+            if (nodeTopY < undergroundCullBelowY)
                 return;
         }
 

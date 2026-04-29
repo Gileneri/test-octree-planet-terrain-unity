@@ -21,7 +21,7 @@ MonoBehaviour:
   surfaceBaseHeight: 0
   surfaceNoiseAmplitude: 64
   minSubsurfaceHeight: -500
-  divisions: 16
+  divisions: 7
   chunkResolution: 32
   cavesEnabled: 1
   caveNoiseFrequency: 0.036

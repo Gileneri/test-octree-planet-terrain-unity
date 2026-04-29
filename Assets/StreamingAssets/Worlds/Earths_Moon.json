@@ -7,7 +7,7 @@
     "surfaceBaseHeight": 0.0,
     "surfaceNoiseAmplitude": 64.0,
     "minSubsurfaceHeight": -500.0,
-    "divisions": 16,
+    "divisions": 7,
     "chunkResolution": 32,
     "cavesEnabled": true,
     "caveNoiseFrequency": 0.035999998450279239,

@@ -71,6 +71,10 @@ public struct NodeJob : IJob
     public float caveNoiseThreshold;    // typical 0.4–0.7 (higher = fewer caves)
     public float caveNoiseAmplitudeY;   // vertical squish, typical 0.3–0.6
     public float caveSurfaceFadeRange;  // Y units below surface where caves fade in
+    public bool cullEnclosedUndergroundFaces;
+    public float enclosedUndergroundFaceMargin;
+    public bool useSurfaceShellOnCoarseLod;
+    public int surfaceShellMinDivisions;
 
     // ── Layer 4 : Geological layers ──────────────────────────────────────
     /// <summary>
@@ -81,9 +85,14 @@ public struct NodeJob : IJob
     [ReadOnly] public NativeArray<GeologicalLayerBlob> geoLayers;
 
     // ── Chunk ─────────────────────────────────────────────────────────────
+    public int nodeDivisions;
     public int chunkResolution;
     public float nodeScale;
     public float3 worldNodePosition;
+    public bool cullUndergroundFacesOnCoarseLod;
+    public int coarseLodFaceCullMinDivisions;
+    public float coarseLodFaceCullMargin;
+    public int coarseLodMinSurfaceVoxels;
 
     // ── Private ───────────────────────────────────────────────────────────
     private float3 centerOffset;
@@ -206,6 +215,8 @@ public struct NodeJob : IJob
 
         int vi = 0;
         int ii = 0;
+        bool applySurfaceShell = useSurfaceShellOnCoarseLod
+            && nodeDivisions >= math.max(1, surfaceShellMinDivisions);
 
         // Pass 1 — evaluate density for every voxel and cache blockIds.
         // This separates density evaluation from meshing so each voxel's
@@ -217,18 +228,103 @@ public struct NodeJob : IJob
                     float3 wp = new float3(x, y, z) * normalizedVoxelScale
                                 + worldNodePosition - centerOffset;
                     blockIds[x * chunkResolution * chunkResolution + y * chunkResolution + z]
-                        = SampleDensity(wp, ref surfaceNoise, ref caveNoise, borderNoises);
+                        = SampleDensity(wp, ref surfaceNoise, ref caveNoise, borderNoises, applySurfaceShell);
                 }
 
         // Pass 2 — emit faces where a solid voxel borders an Air voxel.
+        // Optional: detect "externally reachable" air to avoid emitting deep
+        // underground faces that border fully enclosed air pockets.
+        int voxCount = chunkResolution * chunkResolution * chunkResolution;
+        int res2 = chunkResolution * chunkResolution;
+        bool applyCoarseUndergroundFaceCull = cullUndergroundFacesOnCoarseLod
+            && nodeDivisions >= math.max(1, coarseLodFaceCullMinDivisions);
+        int minSurfaceVoxelsToKeep = math.max(0, coarseLodMinSurfaceVoxels);
+        var reachableAir = new NativeArray<byte>(voxCount, Allocator.Temp, NativeArrayOptions.ClearMemory);
+        var floodQueue = new NativeArray<int>(voxCount, Allocator.Temp, NativeArrayOptions.UninitializedMemory);
+        var topSurfaceYByXZ = new NativeArray<int>(res2, Allocator.Temp, NativeArrayOptions.UninitializedMemory);
+        int qHead = 0;
+        int qTail = 0;
+
+        for (int i = 0; i < res2; i++)
+            topSurfaceYByXZ[i] = -1;
+
+        if (cullEnclosedUndergroundFaces)
+        {
+            for (int x = 0; x < chunkResolution; x++)
+                for (int y = 0; y < chunkResolution; y++)
+                    for (int z = 0; z < chunkResolution; z++)
+                    {
+                        if (x != 0 && x != chunkResolution - 1 &&
+                            y != 0 && y != chunkResolution - 1 &&
+                            z != 0 && z != chunkResolution - 1)
+                            continue;
+
+                        int seedIdx = x * res2 + y * chunkResolution + z;
+                        if (blockIds[seedIdx] != 0 || reachableAir[seedIdx] != 0) continue;
+                        reachableAir[seedIdx] = 1;
+                        floodQueue[qTail++] = seedIdx;
+                    }
+
+            while (qHead < qTail)
+            {
+                int idx = floodQueue[qHead++];
+                int x = idx / res2;
+                int rem = idx - x * res2;
+                int y = rem / chunkResolution;
+                int z = rem - y * chunkResolution;
+
+                for (int side = 0; side < 6; side++)
+                {
+                    int3 nb = Tables.NeighborOffset[side];
+                    int nx = x + nb.x;
+                    int ny = y + nb.y;
+                    int nz = z + nb.z;
+                    if (nx < 0 || nx >= chunkResolution ||
+                        ny < 0 || ny >= chunkResolution ||
+                        nz < 0 || nz >= chunkResolution)
+                        continue;
+
+                    int nIdx = nx * res2 + ny * chunkResolution + nz;
+                    if (blockIds[nIdx] != 0 || reachableAir[nIdx] != 0) continue;
+                    reachableAir[nIdx] = 1;
+                    floodQueue[qTail++] = nIdx;
+                }
+            }
+        }
+
+        if (applyCoarseUndergroundFaceCull && minSurfaceVoxelsToKeep > 0)
+        {
+            for (int x = 0; x < chunkResolution; x++)
+            {
+                int xBase = x * res2;
+                for (int z = 0; z < chunkResolution; z++)
+                {
+                    for (int y = chunkResolution - 1; y >= 0; y--)
+                    {
+                        int idx = xBase + y * chunkResolution + z;
+                        if (blockIds[idx] == 0) continue;
+
+                        bool hasAirAbove = y == chunkResolution - 1 ||
+                            blockIds[xBase + (y + 1) * chunkResolution + z] == 0;
+                        if (hasAirAbove)
+                        {
+                            topSurfaceYByXZ[x * chunkResolution + z] = y;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
         for (int x = 0; x < chunkResolution; x++)
             for (int y = 0; y < chunkResolution; y++)
                 for (int z = 0; z < chunkResolution; z++)
                 {
-                    byte bid = blockIds[x * chunkResolution * chunkResolution + y * chunkResolution + z];
+                    byte bid = blockIds[x * res2 + y * chunkResolution + z];
                     if (bid == 0) continue; // Air
 
                     float3 localPos = new float3(x, y, z) * normalizedVoxelScale - centerOffset;
+                    float3 voxelWp = localPos + worldNodePosition;
 
                     for (int side = 0; side < 6; side++)
                     {
@@ -247,10 +343,45 @@ public struct NodeJob : IJob
                         {
                             float3 wp = new float3(nx, ny, nz) * normalizedVoxelScale
                                         + worldNodePosition - centerOffset;
-                            nbId = SampleDensity(wp, ref surfaceNoise, ref caveNoise, borderNoises);
+                            nbId = SampleDensity(wp, ref surfaceNoise, ref caveNoise, borderNoises, applySurfaceShell);
                         }
 
                         if (nbId != 0) continue; // neighbour is solid — face hidden
+
+                        if (applyCoarseUndergroundFaceCull)
+                        {
+                            int topY = topSurfaceYByXZ[x * chunkResolution + z];
+                            int keepFromY = topY >= 0
+                                ? math.max(0, topY - (minSurfaceVoxelsToKeep - 1))
+                                : int.MaxValue;
+                            bool keepMinimumSurfaceBand = topY >= 0 && y >= keepFromY;
+
+                            if (!keepMinimumSurfaceBand)
+                            {
+                                float3 nwp = new float3(nx, ny, nz) * normalizedVoxelScale
+                                           + worldNodePosition - centerOffset;
+                                float3 faceWp = (voxelWp + nwp) * 0.5f;
+                                float surfaceY = SampleSurfaceHeight(faceWp.x, faceWp.z, ref surfaceNoise);
+                                if (faceWp.y < surfaceY - math.max(0f, coarseLodFaceCullMargin))
+                                    continue;
+                            }
+                        }
+
+                        if (cullEnclosedUndergroundFaces &&
+                            nx >= 0 && nx < chunkResolution &&
+                            ny >= 0 && ny < chunkResolution &&
+                            nz >= 0 && nz < chunkResolution)
+                        {
+                            int nIdx = nx * res2 + ny * chunkResolution + nz;
+                            if (reachableAir[nIdx] == 0)
+                            {
+                                float3 nwp = new float3(nx, ny, nz) * normalizedVoxelScale
+                                           + worldNodePosition - centerOffset;
+                                float surfaceY = SampleSurfaceHeight(nwp.x, nwp.z, ref surfaceNoise);
+                                if (nwp.y < surfaceY - math.max(0f, enclosedUndergroundFaceMargin))
+                                    continue;
+                            }
+                        }
 
                         vertices[vi + 0] = Tables.Vertices[Tables.BuildOrder[side][0]] * normalizedVoxelScale + localPos;
                         vertices[vi + 1] = Tables.Vertices[Tables.BuildOrder[side][1]] * normalizedVoxelScale + localPos;
@@ -299,6 +430,9 @@ public struct NodeJob : IJob
         uvs.Slice(0, vi).CopyTo(uvSlice);
         blockData.Slice(0, vi).CopyTo(bdSlice);
 
+        reachableAir.Dispose();
+        floodQueue.Dispose();
+        topSurfaceYByXZ.Dispose();
         borderNoises.Dispose();
 
         MeshingUtility.ApplyMesh(ref meshDataArray,
@@ -317,11 +451,12 @@ public struct NodeJob : IJob
     /// </summary>
     private byte SampleDensityLocal(int lx, int ly, int lz,
         ref FastNoiseLite surfaceNoise, ref FastNoiseLite caveNoise,
-        NativeArray<FastNoiseLite> borderNoises)
+        NativeArray<FastNoiseLite> borderNoises,
+        bool applySurfaceShell)
     {
         float3 wp = new float3(lx, ly, lz) * normalizedVoxelScale
                     + worldNodePosition - centerOffset;
-        return SampleDensity(wp, ref surfaceNoise, ref caveNoise, borderNoises);
+        return SampleDensity(wp, ref surfaceNoise, ref caveNoise, borderNoises, applySurfaceShell);
     }
 
     /// <summary>
@@ -339,7 +474,8 @@ public struct NodeJob : IJob
     /// </summary>
     private byte SampleDensity(float3 wp,
         ref FastNoiseLite surfaceNoise, ref FastNoiseLite caveNoise,
-        NativeArray<FastNoiseLite> borderNoises)
+        NativeArray<FastNoiseLite> borderNoises,
+        bool applySurfaceShell)
     {
         // ── Layer 0 : Floor ────────────────────────────────────────────────
         if (wp.y < minSubsurfaceHeight)
@@ -358,7 +494,9 @@ public struct NodeJob : IJob
                 modKeys[i].y == key.y &&
                 modKeys[i].z == key.z)
             {
-                return modValues[i] == 1 ? (byte)0 : SolidId(wp);
+                if (modValues[i] == 1)
+                    return applySurfaceShell ? SolidId(wp) : (byte)0;
+                return SolidId(wp);
             }
         }
 
@@ -369,38 +507,15 @@ public struct NodeJob : IJob
         if (wp.y > maxSurface)
             return 0; // Air — definitely above terrain
 
-        float surfaceY;
-        if (wp.y < minSurface)
-        {
-            surfaceY = maxSurface; // definitely below — skip noise
-        }
-        else
-        {
-            float wx = PosMod(wp.x, worldSizeX);
-            float wz = PosMod(wp.z, worldSizeZ);
-
-            float aX = wx / worldSizeX * 2f * math.PI;
-            float aZ = wz / worldSizeZ * 2f * math.PI;
-            float R = worldSizeX / (2f * math.PI);
-            float S = worldSizeZ / (2f * math.PI);
-
-            float cx = math.cos(aX) * R;
-            float sx = math.sin(aX) * R;
-            float cz = math.cos(aZ) * S;
-            float sz = math.sin(aZ) * S;
-
-            float n1 = surfaceNoise.GetNoise(cx, sx, cz);
-            float n2 = surfaceNoise.GetNoise(cz + 100f, sz + 100f, cx * 0.5f);
-            float n3 = surfaceNoise.GetNoise(sx * 0.7f, sz * 0.7f + 200f, cz * 0.3f);
-
-            surfaceY = surfaceBaseHeight + (n1 * 0.6f + n2 * 0.3f + n3 * 0.1f) * surfaceNoiseAmplitude;
-        }
+        float surfaceY = wp.y < minSurface
+            ? maxSurface // definitely below — skip noise
+            : SampleSurfaceHeight(wp.x, wp.z, ref surfaceNoise);
 
         if (wp.y > surfaceY)
             return 0; // Air — above surface
 
         // ── Layer 3 : Caves ────────────────────────────────────────────────
-        if (cavesEnabled)
+        if (cavesEnabled && !applySurfaceShell)
         {
             float depthBelowSurface = surfaceY - wp.y;
             float fade = caveSurfaceFadeRange > 0f
@@ -483,5 +598,27 @@ public struct NodeJob : IJob
     {
         float r = x % m;
         return r < 0f ? r + m : r;
+    }
+
+    private float SampleSurfaceHeight(float wxWorld, float wzWorld, ref FastNoiseLite surfaceNoise)
+    {
+        float wx = PosMod(wxWorld, worldSizeX);
+        float wz = PosMod(wzWorld, worldSizeZ);
+
+        float aX = wx / worldSizeX * 2f * math.PI;
+        float aZ = wz / worldSizeZ * 2f * math.PI;
+        float R = worldSizeX / (2f * math.PI);
+        float S = worldSizeZ / (2f * math.PI);
+
+        float cx = math.cos(aX) * R;
+        float sx = math.sin(aX) * R;
+        float cz = math.cos(aZ) * S;
+        float sz = math.sin(aZ) * S;
+
+        float n1 = surfaceNoise.GetNoise(cx, sx, cz);
+        float n2 = surfaceNoise.GetNoise(cz + 100f, sz + 100f, cx * 0.5f);
+        float n3 = surfaceNoise.GetNoise(sx * 0.7f, sz * 0.7f + 200f, cz * 0.3f);
+
+        return surfaceBaseHeight + (n1 * 0.6f + n2 * 0.3f + n3 * 0.1f) * surfaceNoiseAmplitude;
     }
 }

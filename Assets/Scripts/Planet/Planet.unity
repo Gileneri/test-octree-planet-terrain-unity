@@ -622,12 +622,6 @@ MonoBehaviour:
   completeBudgetMs: 2.5
   maxCompletionsPerFrame: 24
   maxInteractiveCompletionsPerFrame: 8
-  logMeshingRuntime: 0
-  meshingLogInterval: 0.5
-  logInFlightSaturationWarnings: 1
-  saturationWarningInterval: 1
-  showFpsCounter: 1
-  fpsSmoothing: 0.15
   newCellsPerFrame: 3
   maxNodeCreationsPerFrame: 50
   enableUndergroundNodeCull: 0
@@ -636,8 +630,6 @@ MonoBehaviour:
   enclosedUndergroundFaceMargin: 2
   useSurfaceShellOnCoarseLod: 1
   surfaceShellMinDivisions: 6
-  disableSurfaceShellWhenUnderground: 1
-  undergroundShellDisableMargin: 8
   cullUndergroundFacesOnCoarseLod: 0
   coarseLodFaceCullMinDivisions: 4
   coarseLodFaceCullMargin: 1.5

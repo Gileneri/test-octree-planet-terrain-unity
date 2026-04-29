@@ -37,6 +37,37 @@ public class Node
     /// </summary>
     private bool meshReady = false;
 
+    /// <summary>
+    /// Cached "this entire subtree has nothing to do this frame" flag.
+    /// True when this node and every descendant are meshReady, not scheduled,
+    /// not needing redraw, and (recursively) their children are stable too.
+    /// Octree.CollectJobs and Node.UpdateVisibility use this to skip whole
+    /// subtrees instantly — without it, every Tick walks the entire tree
+    /// (potentially tens of thousands of nodes) just to do nothing.
+    /// </summary>
+    private bool subtreeStable = false;
+
+    /// <summary>
+    /// Records the forceHidden value the last time UpdateVisibilityImpl ran on
+    /// this node. We early-out only when the parent's "force me hidden" hint
+    /// is the same as last frame; otherwise the ancestor flipped from
+    /// rendering to delegating (or vice versa) and we have to re-evaluate
+    /// our own renderer state, even if our subtree is otherwise stable.
+    /// </summary>
+    private bool lastForceHidden = false;
+
+    /// <summary>
+    /// Async PhysX cooking — see BakeMeshJob. We schedule the bake right after
+    /// applying the mesh so the heavy main-thread cook isn't done at all on
+    /// the main thread; we only assign the cooked mesh to the collider once
+    /// the bake handle reports completion. Until then the collider has no
+    /// physics data attached — that's fine: visibility shows the mesh
+    /// instantly, only the collision lags by a few ms.
+    /// </summary>
+    private bool hasPendingBake = false;
+    private JobHandle pendingBakeHandle;
+    private Mesh pendingBakeMesh;
+
     private int meshRevision = 0;
 
     // -----------------------------------------------------------------------
@@ -55,6 +86,22 @@ public class Node
         meshFilter = gameObject.GetComponent<MeshFilter>();
         meshRenderer = gameObject.GetComponent<MeshRenderer>();
 
+        // ── Renderer perf hardening ───────────────────────────────────────
+        // Procedural voxel terrain has thousands of chunks. Each one paying
+        // for shadow casting, light/reflection probe sampling, motion vectors
+        // and dynamic-occludee bookkeeping is a *huge* per-frame cost on the
+        // GPU and the main thread. We force the cheapest settings here so
+        // they cannot be re-introduced by accidentally re-saving the prefab.
+        if (meshRenderer != null)
+        {
+            meshRenderer.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
+            meshRenderer.receiveShadows = true; // keep — gives the terrain shading depth
+            meshRenderer.lightProbeUsage = UnityEngine.Rendering.LightProbeUsage.Off;
+            meshRenderer.reflectionProbeUsage = UnityEngine.Rendering.ReflectionProbeUsage.Off;
+            meshRenderer.allowOcclusionWhenDynamic = false;
+            meshRenderer.motionVectorGenerationMode = MotionVectorGenerationMode.ForceNoMotion;
+        }
+
         // Only attach a MeshCollider on fine-grained nodes (small voxels).
         // Coarse nodes have voxels too large for PhysX (>500u triangle warning).
         // maxColliderDivisions is computed by OctreeGrid so voxelSize <= 32u.
@@ -63,25 +110,55 @@ public class Node
             meshCollider = gameObject.GetComponent<MeshCollider>();
             if (meshCollider == null)
                 meshCollider = gameObject.AddComponent<MeshCollider>();
+
+            // Skip every cooking step PhysX runs by default. The terrain is
+            // procedural and rebuilt very frequently — we want fast bakes,
+            // not maximally optimised query speed. None makes cooking 5-10×
+            // faster (a 5–30 ms main-thread spike per chunk → sub-millisecond).
+            meshCollider.cookingOptions = MeshColliderCookingOptions.None;
         }
 
         var pos = NodePosition();
         gameObject.transform.position = pos;
         gameObject.name = pos.ToString();
+
+        // A brand-new node always has work to do (mesh isn't built yet).
+        // Walk the parent chain to mark them as needing collection too.
+        if (parent != null)
+            parent.InvalidateStability();
     }
 
     // -----------------------------------------------------------------------
 
     public void Clear()
     {
-        meshFilter.mesh = null;
+        // Wait for any pending PhysX cook before tearing the mesh down —
+        // BakeMesh is reading the Mesh asset by instance id on a worker
+        // thread and would crash if we destroyed it from under it.
+        if (hasPendingBake)
+        {
+            pendingBakeHandle.Complete();
+            hasPendingBake = false;
+            pendingBakeMesh = null;
+        }
+
         if (meshCollider != null) meshCollider.sharedMesh = null;
-        appliedMesh = null;
+        meshFilter.mesh = null;
+
+        // Explicitly destroy the mesh asset to avoid leaking a Mesh per
+        // node that lives forever until the next full GC pass.
+        if (appliedMesh != null)
+        {
+            GameObject.Destroy(appliedMesh);
+            appliedMesh = null;
+        }
+
         needsDrawn = true;
         meshReady = false;
         // Invalidate any in-flight job result for this node so stale meshes
         // cannot be applied later on top of newer state.
         meshRevision++;
+        InvalidateStability();
     }
 
     public void MarkDirty()
@@ -92,11 +169,76 @@ public class Node
         // showing the old mesh while the new job is in flight.
         needsDrawn = true;
         meshRevision++;
+        InvalidateStability();
     }
+
+    /// <summary>
+    /// Marks this node and all its ancestors as "potentially needs work" so
+    /// CollectJobs and UpdateVisibility re-visit them. Cheap walk to the root.
+    /// Call any time a node's state transitions in a way that could affect
+    /// scheduling or visibility (creation, MarkDirty, Clear, child change,
+    /// mesh applied, etc.).
+    /// </summary>
+    public void InvalidateStability()
+    {
+        var n = this;
+        while (n != null && n.subtreeStable)
+        {
+            n.subtreeStable = false;
+            n = n.parent;
+        }
+    }
+
+    /// <summary>True if Octree.CollectJobs / Node.UpdateVisibility can skip this entire subtree.</summary>
+    public bool SubtreeStable => subtreeStable;
 
     public void Destroy()
     {
+        // If a collider bake is still in flight we MUST wait for it before
+        // destroying the mesh — Physics.BakeMesh references the mesh by
+        // instanceID and would crash if Unity GC'd the mesh underneath it.
+        if (hasPendingBake)
+        {
+            pendingBakeHandle.Complete();
+            hasPendingBake = false;
+            pendingBakeMesh = null;
+        }
+
+        // Mesh assets aren't auto-destroyed when the host GameObject dies —
+        // they linger until a full GC, and after a few minutes of travel
+        // that pile becomes a multi-second hitch. Free it explicitly.
+        if (appliedMesh != null)
+        {
+            GameObject.Destroy(appliedMesh);
+            appliedMesh = null;
+        }
+
         GameObject.Destroy(gameObject);
+    }
+
+    /// <summary>
+    /// Polls the pending async collider bake. If finished, completes the
+    /// handle and assigns the cooked mesh to the MeshCollider. Cheap when
+    /// no bake is pending. Called once per Tick from UpdateVisibilityImpl.
+    /// </summary>
+    private void ResolvePendingBake()
+    {
+        if (!hasPendingBake) return;
+        if (!pendingBakeHandle.IsCompleted) return;
+
+        pendingBakeHandle.Complete();
+        // Only push the cooked mesh into the collider if the node still
+        // has the same mesh applied (i.e., a newer mesh hasn't superseded it).
+        if (meshCollider != null && pendingBakeMesh != null
+            && pendingBakeMesh == appliedMesh
+            && pendingBakeMesh.vertexCount > 0
+            && meshRenderer != null && meshRenderer.enabled)
+        {
+            meshCollider.sharedMesh = pendingBakeMesh;
+        }
+
+        hasPendingBake = false;
+        pendingBakeMesh = null;
     }
 
     // -----------------------------------------------------------------------
@@ -205,6 +347,21 @@ public class Node
                     return;
                 }
 
+                // Wait for any older bake to finish — its mesh is about to be
+                // replaced/destroyed and PhysX must not still be reading it.
+                if (hasPendingBake)
+                {
+                    pendingBakeHandle.Complete();
+                    hasPendingBake = false;
+                    pendingBakeMesh = null;
+                }
+
+                // Destroy the previous mesh explicitly. MeshFilter.mesh ownership
+                // does NOT auto-destroy old meshes in Play mode; without this
+                // every re-mesh leaks a Mesh until the next GC, which causes
+                // periodic stutters once a few thousand have piled up.
+                var oldMesh = appliedMesh;
+
                 var mesh = new Mesh { name = "node_mesh", bounds = bounds };
                 Mesh.ApplyAndDisposeWritableMeshData(meshDataArray, mesh);
                 // Normals are written per-face inside NodeJob (Tables.Normals[side])
@@ -213,13 +370,42 @@ public class Node
                 capturedFilter.mesh = mesh;
                 appliedMesh = mesh;
                 meshReady = true;
-                // The collider's sharedMesh is managed by SetVisible() inside
-                // UpdateVisibility — only the currently-displayed node should
-                // expose its mesh to PhysX, otherwise overlapping coarse +
-                // fine colliders could fight each other during transitions.
-                if (capturedCollider != null && capturedRenderer != null && capturedRenderer.enabled)
-                    capturedCollider.sharedMesh = mesh;
+
+                if (oldMesh != null && oldMesh != mesh)
+                {
+                    // Detach from collider first — destroying a Mesh that is
+                    // assigned to a MeshCollider's sharedMesh would leave a
+                    // dangling reference inside PhysX.
+                    if (capturedCollider != null && capturedCollider.sharedMesh == oldMesh)
+                        capturedCollider.sharedMesh = null;
+                    GameObject.Destroy(oldMesh);
+                }
+
+                // Async collider cooking. Assigning sharedMesh on the main
+                // thread would trigger PhysX to cook the mesh inline (5–30 ms
+                // per chunk). Instead we kick a BakeMeshJob to a worker
+                // thread; once it finishes, ResolvePendingBake() (called from
+                // UpdateVisibilityImpl) does a near-free sharedMesh = mesh.
+                if (capturedCollider != null && mesh.vertexCount > 0)
+                {
+                    pendingBakeMesh = mesh;
+                    pendingBakeHandle = new BakeMeshJob
+                    {
+                        meshId = mesh.GetInstanceID(),
+                        convex = false,
+                    }.Schedule();
+                    hasPendingBake = true;
+                }
+                else if (capturedCollider != null)
+                {
+                    // Empty mesh — clear any stale collider data.
+                    if (capturedCollider.sharedMesh != null)
+                        capturedCollider.sharedMesh = null;
+                }
                 isScheduled = false;
+                // Mesh just became ready — visibility may need re-evaluating
+                // up the chain (CanCover() of ancestors might now flip true).
+                InvalidateStability();
                 if (jobModKeys.IsCreated) jobModKeys.Dispose();
                 if (jobModValues.IsCreated) jobModValues.Dispose();
                 if (jobGeoLayers.IsCreated) jobGeoLayers.Dispose();
@@ -237,6 +423,7 @@ public class Node
                 // If the node changed while this job was pending/running, keep
                 // it dirty so a newer job is collected next frame.
                 needsDrawn = true;
+                InvalidateStability();
             }
         );
 
@@ -256,16 +443,10 @@ public class Node
             return;
         }
 
+        // WorldModifications now writes directly into our NativeArrays — no
+        // intermediate List<T> / managed-array allocation per call.
         wm.GetModificationsForNode(nodePos, scale, octree.chunkResolution,
-            out Vector3Int[] kArr, out WorldModifications.VoxelState[] vArr);
-
-        keys = new NativeArray<int3>(kArr.Length, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
-        values = new NativeArray<byte>(vArr.Length, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
-        for (int i = 0; i < kArr.Length; i++)
-        {
-            keys[i] = new int3(kArr[i].x, kArr[i].y, kArr[i].z);
-            values[i] = (byte)vArr[i];
-        }
+            Allocator.Persistent, out keys, out values);
     }
 
     // -----------------------------------------------------------------------
@@ -330,63 +511,108 @@ public class Node
     ///   - otherwise render at this node if it has a mesh
     ///   - otherwise recurse and show whatever partial coverage exists
     ///
-    /// Called once per Octree.Tick from the root. Single pass, top-down,
-    /// O(active nodes) — no allocations.
+    /// Called once per Octree.Tick from the root. Top-down, O(active nodes)
+    /// in the worst case — but stable subtrees early-out via subtreeStable
+    /// so most frames touch only a tiny slice of the tree near the player.
+    /// No allocations.
+    ///
+    /// Also computes and caches the subtreeStable flag as a side-effect, so
+    /// CollectJobs and the next UpdateVisibility can skip stable subtrees.
     /// </summary>
     public void UpdateVisibility()
     {
-        if (children == null)
-        {
-            SetVisible(meshReady);
-            return;
-        }
+        UpdateVisibilityImpl(forceHidden: false);
+    }
 
-        bool allChildrenCanCover = true;
-        for (int i = 0; i < children.Length; i++)
-        {
-            if (!children[i].CanCover())
-            {
-                allChildrenCanCover = false;
-                break;
-            }
-        }
+    private void UpdateVisibilityImpl(bool forceHidden)
+    {
+        // Pick up any async PhysX collider bake that just finished.
+        // Cheap when none is pending, otherwise assigns sharedMesh.
+        ResolvePendingBake();
 
-        if (allChildrenCanCover)
+        // Stable subtrees have nothing to do — no pending jobs, no visibility
+        // changes since last frame. Skip immediately. We also require the
+        // parent's forceHidden hint to match what we saw last time; if the
+        // ancestor flipped between rendering and delegating, our renderer
+        // state needs to flip too even if all our jobs are done.
+        if (subtreeStable && lastForceHidden == forceHidden) return;
+
+        bool wantVisible;
+        bool forceChildrenHidden;
+        bool recurseChildren;
+
+        if (forceHidden)
         {
-            // Deepest-coverage path: hide this node, recurse into children.
-            SetVisible(false);
-            for (int i = 0; i < children.Length; i++)
-                children[i].UpdateVisibility();
+            // An ancestor is rendering and we must stay hidden, but we still
+            // recurse so child stability flags stay accurate.
+            wantVisible = false;
+            forceChildrenHidden = true;
+            recurseChildren = children != null;
         }
-        else if (meshReady)
+        else if (children == null)
         {
-            // Children not fully ready — keep this node's coarse mesh up so
-            // there is no visible hole. Hide the entire subtree below us.
-            SetVisible(true);
-            for (int i = 0; i < children.Length; i++)
-                children[i].DisableSubtree();
+            wantVisible = meshReady;
+            forceChildrenHidden = false;
+            recurseChildren = false;
         }
         else
         {
-            // No mesh on this node either. Render whatever children we have
-            // (partial coverage). This only happens during the very first
-            // frames after spawning before any mesh has been applied.
-            SetVisible(false);
+            bool allChildrenCanCover = true;
             for (int i = 0; i < children.Length; i++)
-                children[i].UpdateVisibility();
-        }
-    }
+            {
+                if (!children[i].CanCover())
+                {
+                    allChildrenCanCover = false;
+                    break;
+                }
+            }
 
-    /// <summary>
-    /// Recursively turns off rendering and disables the collider mesh for
-    /// this entire subtree. Used when an ancestor takes over rendering.
-    /// </summary>
-    private void DisableSubtree()
-    {
-        SetVisible(false);
-        if (children == null) return;
-        for (int i = 0; i < children.Length; i++)
-            children[i].DisableSubtree();
+            if (allChildrenCanCover)
+            {
+                // Deepest-coverage path: hide this node, recurse into children.
+                wantVisible = false;
+                forceChildrenHidden = false;
+                recurseChildren = true;
+            }
+            else if (meshReady)
+            {
+                // Children not fully ready — keep this node's coarse mesh up so
+                // there is no visible hole. Force the entire subtree hidden.
+                wantVisible = true;
+                forceChildrenHidden = true;
+                recurseChildren = true;
+            }
+            else
+            {
+                // No mesh on this node either. Render whatever children we have
+                // (partial coverage). This only happens during the very first
+                // frames after spawning before any mesh has been applied.
+                wantVisible = false;
+                forceChildrenHidden = false;
+                recurseChildren = true;
+            }
+        }
+
+        SetVisible(wantVisible);
+
+        bool allChildrenStable = true;
+        if (recurseChildren)
+        {
+            for (int i = 0; i < children.Length; i++)
+            {
+                children[i].UpdateVisibilityImpl(forceChildrenHidden);
+                if (!children[i].subtreeStable) allChildrenStable = false;
+            }
+        }
+
+        // Cache: this subtree is stable when this node has no pending work
+        // AND every child's subtree is also stable. Cleared by InvalidateStability
+        // whenever something changes (job apply, MarkDirty, new node, etc.).
+        // A pending collider bake also counts as "work" — we need to revisit
+        // next frame to resolve it.
+        bool selfNoWork = meshReady && !needsDrawn && !isScheduled && !hasPendingBake;
+        subtreeStable = selfNoWork && (children == null || allChildrenStable);
+        lastForceHidden = forceHidden;
     }
 
     /// <summary>
@@ -394,17 +620,38 @@ public class Node
     /// the mesh to the collider. Keeping these two in sync prevents the
     /// player from colliding with hidden coarse geometry while looking at
     /// the fine version (and vice-versa) during LOD transitions.
+    ///
+    /// If a collider bake is still in flight we leave whatever sharedMesh
+    /// the collider has alone — assigning the new (uncooked) mesh here
+    /// would trigger a synchronous PhysX cook on the main thread, which is
+    /// exactly the cost the async bake exists to avoid. ResolvePendingBake
+    /// will install the cooked mesh next frame.
     /// </summary>
     private void SetVisible(bool visible)
     {
         if (meshRenderer != null && meshRenderer.enabled != visible)
             meshRenderer.enabled = visible;
 
-        if (meshCollider != null)
+        if (meshCollider == null) return;
+
+        if (!visible)
         {
-            var desired = visible ? appliedMesh : null;
-            if (meshCollider.sharedMesh != desired)
-                meshCollider.sharedMesh = desired;
+            if (meshCollider.sharedMesh != null)
+                meshCollider.sharedMesh = null;
+            return;
         }
+
+        if (hasPendingBake) return; // wait for ResolvePendingBake
+
+        // Treat empty meshes as null for the collider — assigning a mesh
+        // with zero vertices to a MeshCollider triggers a noisy Unity
+        // warning ("...but the mesh doesn't have any vertices"), and
+        // there is nothing to collide with anyway. Empty meshes happen
+        // for chunks that are entirely air or entirely solid.
+        Mesh desired = (appliedMesh != null && appliedMesh.vertexCount > 0)
+            ? appliedMesh
+            : null;
+        if (meshCollider.sharedMesh != desired)
+            meshCollider.sharedMesh = desired;
     }
 }

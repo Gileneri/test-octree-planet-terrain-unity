@@ -273,6 +273,13 @@ public class Octree : MonoBehaviour
 
     private void CollectJobs(Node node, List<OctreeGrid.PrioritizedJob> jobList, Vector3 playerPos)
     {
+        // ── Stable-subtree fast path ──────────────────────────────────────
+        // If nothing in this subtree changed since UpdateVisibility set the
+        // flag last frame (no scheduled jobs, no dirty meshes, no new nodes),
+        // skip the entire recursion. This turns per-frame tree walks for
+        // tens of thousands of "cold" nodes into a single pointer compare.
+        if (node.SubtreeStable) return;
+
         // ── Frustum culling: REMOVED ON PURPOSE ──────────────────────────
         //
         // Earlier versions skipped the entire subtree when its AABB sat

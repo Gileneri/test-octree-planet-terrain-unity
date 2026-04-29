@@ -1,5 +1,7 @@
 using System.Collections.Generic;
 using UnityEngine;
+using Unity.Collections;
+using Unity.Mathematics;
 
 /// <summary>
 /// Singleton that stores every player-made voxel modification.
@@ -86,38 +88,78 @@ public class WorldModifications : MonoBehaviour
     public int Count => modifications.Count;
 
     /// <summary>
-    /// Copies all modifications that overlap a node's AABB into flat arrays
-    /// for passing to a Burst job (NodeJob.modKeys / modValues).
+    /// Writes all modifications that overlap a node's AABB directly into
+    /// freshly-allocated NativeArrays for passing to a Burst job
+    /// (NodeJob.modKeys / modValues).
     ///
     /// The AABB is expanded by 1 voxel so NodeJob can correctly evaluate
     /// neighbour voxels that sit just outside this chunk's border — needed
     /// for correct face culling at seams between chunks.
+    ///
+    /// PERFORMANCE
+    /// ───────────
+    /// This is on the hot meshing path — called once per chunk every time it
+    /// is (re)scheduled. The previous implementation allocated 2 List&lt;T&gt;,
+    /// boxed per-element and then ToArray()'d each one, generating GC garbage
+    /// in proportion to the number of meshing jobs in flight. We now do two
+    /// simple O(N) passes over the dictionary (first to count, then to fill)
+    /// and write straight into the caller's NativeArrays — zero managed
+    /// allocations on the typical "no overlapping mods" path, which is
+    /// 99%+ of chunks during normal play.
     /// </summary>
     public void GetModificationsForNode(
         Vector3 nodeWorldPos, float nodeScale, int chunkResolution,
-        out Vector3Int[] keys, out VoxelState[] values)
+        Allocator allocator,
+        out NativeArray<int3> keys, out NativeArray<byte> values)
     {
+        // Fast path: no modifications anywhere in the world. Most chunks at
+        // boot fall here, so the Dictionary iteration cost is skipped entirely.
+        if (modifications.Count == 0)
+        {
+            keys = new NativeArray<int3>(0, allocator);
+            values = new NativeArray<byte>(0, allocator);
+            return;
+        }
+
         float voxelSize = nodeScale / chunkResolution;
         float half = nodeScale * 0.5f + voxelSize;
+        float minX = nodeWorldPos.x - half;
+        float maxX = nodeWorldPos.x + half;
+        float minY = nodeWorldPos.y - half;
+        float maxY = nodeWorldPos.y + half;
+        float minZ = nodeWorldPos.z - half;
+        float maxZ = nodeWorldPos.z + half;
 
-        var kList = new List<Vector3Int>();
-        var vList = new List<VoxelState>();
-
+        // Pass 1 — count overlaps so the NativeArrays can be sized exactly.
+        int count = 0;
         foreach (var kv in modifications)
         {
             Vector3 wp = ClosestWorldPos(kv.Key, nodeWorldPos);
-
-            if (wp.x >= nodeWorldPos.x - half && wp.x <= nodeWorldPos.x + half &&
-                wp.y >= nodeWorldPos.y - half && wp.y <= nodeWorldPos.y + half &&
-                wp.z >= nodeWorldPos.z - half && wp.z <= nodeWorldPos.z + half)
-            {
-                kList.Add(kv.Key);
-                vList.Add(kv.Value);
-            }
+            if (wp.x >= minX && wp.x <= maxX &&
+                wp.y >= minY && wp.y <= maxY &&
+                wp.z >= minZ && wp.z <= maxZ)
+                count++;
         }
 
-        keys = kList.ToArray();
-        values = vList.ToArray();
+        keys = new NativeArray<int3>(count, allocator, NativeArrayOptions.UninitializedMemory);
+        values = new NativeArray<byte>(count, allocator, NativeArrayOptions.UninitializedMemory);
+
+        if (count == 0) return;
+
+        // Pass 2 — fill the arrays.
+        int i = 0;
+        foreach (var kv in modifications)
+        {
+            Vector3 wp = ClosestWorldPos(kv.Key, nodeWorldPos);
+            if (wp.x >= minX && wp.x <= maxX &&
+                wp.y >= minY && wp.y <= maxY &&
+                wp.z >= minZ && wp.z <= maxZ)
+            {
+                keys[i] = new int3(kv.Key.x, kv.Key.y, kv.Key.z);
+                values[i] = (byte)kv.Value;
+                i++;
+            }
+        }
     }
 
     // -----------------------------------------------------------------------

@@ -16,9 +16,27 @@ public class Node
     private MeshRenderer meshRenderer;
     private MeshCollider meshCollider;
 
+    /// <summary>
+    /// Reference to the mesh currently applied to this node.
+    /// Used by the hierarchical visibility logic (UpdateVisibility) so we can
+    /// re-attach / detach the mesh to the collider atomically when the node
+    /// becomes (in)visible without re-allocating.
+    /// </summary>
+    private Mesh appliedMesh;
+
     public bool IsScheduled => isScheduled;
     private bool isScheduled = false;
     private bool needsDrawn = true;
+
+    /// <summary>
+    /// True once a NodeJob has finished and the mesh has been applied to this
+    /// node. Stays true even when the mesh is "stale" relative to a new
+    /// MarkDirty refresh — we want to keep showing the OLD mesh until the
+    /// fresh one is ready, otherwise the player would see one-frame flicker.
+    /// Reset to false only by Clear() (full invalidation, e.g. node destroyed).
+    /// </summary>
+    private bool meshReady = false;
+
     private int meshRevision = 0;
 
     // -----------------------------------------------------------------------
@@ -58,10 +76,11 @@ public class Node
     {
         meshFilter.mesh = null;
         if (meshCollider != null) meshCollider.sharedMesh = null;
+        appliedMesh = null;
         needsDrawn = true;
-        // Invalidate any in-flight job result for this node (e.g. when a parent
-        // node is cleared due to subdivision) so stale coarse meshes cannot be
-        // applied later on top of detailed children.
+        meshReady = false;
+        // Invalidate any in-flight job result for this node so stale meshes
+        // cannot be applied later on top of newer state.
         meshRevision++;
     }
 
@@ -69,6 +88,8 @@ public class Node
     {
         // Keep the current mesh visible until the refreshed mesh is ready.
         // This avoids one-frame unload/load flicker around interactions.
+        // meshReady stays true on purpose — UpdateVisibility uses it to keep
+        // showing the old mesh while the new job is in flight.
         needsDrawn = true;
         meshRevision++;
     }
@@ -90,7 +111,14 @@ public class Node
 
     public bool TryCollectJob(out JobCompleter jobCompleter)
     {
-        if (!IsLeaf() || !needsDrawn || isScheduled)
+        // We deliberately do NOT require IsLeaf here. Intermediate (non-leaf)
+        // nodes also schedule their mesh so they can act as a coarse fallback
+        // when their subtree isn't fully ready yet (e.g. during deep init,
+        // during subdivision while children are loading, or during collapse).
+        //
+        // Without this, a player rotating the camera or moving away would see
+        // holes wherever the deepest leaves haven't finished meshing.
+        if (!needsDrawn || isScheduled)
         {
             jobCompleter = null;
             return false;
@@ -145,6 +173,7 @@ public class Node
 
         var capturedFilter = meshFilter;
         var capturedCollider = meshCollider;
+        var capturedRenderer = meshRenderer;
 
         jobCompleter = new JobCompleter(
             // schedule — start the Burst job
@@ -182,7 +211,14 @@ public class Node
                 // and arrive ready in stream 1 — RecalculateNormals() is not needed
                 // and would block the main thread re-computing what we already have.
                 capturedFilter.mesh = mesh;
-                if (capturedCollider != null) capturedCollider.sharedMesh = mesh;
+                appliedMesh = mesh;
+                meshReady = true;
+                // The collider's sharedMesh is managed by SetVisible() inside
+                // UpdateVisibility — only the currently-displayed node should
+                // expose its mesh to PhysX, otherwise overlapping coarse +
+                // fine colliders could fight each other during transitions.
+                if (capturedCollider != null && capturedRenderer != null && capturedRenderer.enabled)
+                    capturedCollider.sharedMesh = mesh;
                 isScheduled = false;
                 if (jobModKeys.IsCreated) jobModKeys.Dispose();
                 if (jobModValues.IsCreated) jobModValues.Dispose();
@@ -261,5 +297,114 @@ public class Node
         if (parent == null) return offset;
         float ns = NodeScale();
         return (offset * ns) - (Vector3.one * (ns * 0.5f)) + parent.NodePosition();
+    }
+
+    // -----------------------------------------------------------------------
+    //  Hierarchical visibility
+    //
+    //  These methods replace the old "clear-parent-on-subdivide" approach.
+    //  The tree always renders at the deepest level where every descendant
+    //  has a mesh ready; otherwise it falls back to the coarsest ancestor
+    //  that does. This gives perfectly atomic LOD swaps with no holes —
+    //  the coarse parent's mesh stays visible until ALL of its children's
+    //  meshes are ready, then they swap in one frame.
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// Returns true if this subtree can be rendered with full coverage.
+    /// Either this node has its own mesh ready, or every child can cover
+    /// its own volume recursively.
+    /// </summary>
+    public bool CanCover()
+    {
+        if (meshReady) return true;
+        if (children == null) return false;
+        for (int i = 0; i < children.Length; i++)
+            if (!children[i].CanCover()) return false;
+        return true;
+    }
+
+    /// <summary>
+    /// Recursively chooses which nodes in the subtree are rendered:
+    ///   - prefer rendering at the deepest level where ALL children can cover
+    ///   - otherwise render at this node if it has a mesh
+    ///   - otherwise recurse and show whatever partial coverage exists
+    ///
+    /// Called once per Octree.Tick from the root. Single pass, top-down,
+    /// O(active nodes) — no allocations.
+    /// </summary>
+    public void UpdateVisibility()
+    {
+        if (children == null)
+        {
+            SetVisible(meshReady);
+            return;
+        }
+
+        bool allChildrenCanCover = true;
+        for (int i = 0; i < children.Length; i++)
+        {
+            if (!children[i].CanCover())
+            {
+                allChildrenCanCover = false;
+                break;
+            }
+        }
+
+        if (allChildrenCanCover)
+        {
+            // Deepest-coverage path: hide this node, recurse into children.
+            SetVisible(false);
+            for (int i = 0; i < children.Length; i++)
+                children[i].UpdateVisibility();
+        }
+        else if (meshReady)
+        {
+            // Children not fully ready — keep this node's coarse mesh up so
+            // there is no visible hole. Hide the entire subtree below us.
+            SetVisible(true);
+            for (int i = 0; i < children.Length; i++)
+                children[i].DisableSubtree();
+        }
+        else
+        {
+            // No mesh on this node either. Render whatever children we have
+            // (partial coverage). This only happens during the very first
+            // frames after spawning before any mesh has been applied.
+            SetVisible(false);
+            for (int i = 0; i < children.Length; i++)
+                children[i].UpdateVisibility();
+        }
+    }
+
+    /// <summary>
+    /// Recursively turns off rendering and disables the collider mesh for
+    /// this entire subtree. Used when an ancestor takes over rendering.
+    /// </summary>
+    private void DisableSubtree()
+    {
+        SetVisible(false);
+        if (children == null) return;
+        for (int i = 0; i < children.Length; i++)
+            children[i].DisableSubtree();
+    }
+
+    /// <summary>
+    /// Atomically sets the renderer enabled/disabled and attaches/detaches
+    /// the mesh to the collider. Keeping these two in sync prevents the
+    /// player from colliding with hidden coarse geometry while looking at
+    /// the fine version (and vice-versa) during LOD transitions.
+    /// </summary>
+    private void SetVisible(bool visible)
+    {
+        if (meshRenderer != null && meshRenderer.enabled != visible)
+            meshRenderer.enabled = visible;
+
+        if (meshCollider != null)
+        {
+            var desired = visible ? appliedMesh : null;
+            if (meshCollider.sharedMesh != desired)
+                meshCollider.sharedMesh = desired;
+        }
     }
 }

@@ -48,9 +48,11 @@ public class Octree : MonoBehaviour
 
     /// <summary>
     /// Frustum planes updated every frame by OctreeGrid before calling Tick.
-    /// CollectJobs uses these to skip mesh generation for nodes fully outside
-    /// the camera frustum. Traverse is NOT affected — the tree structure must
-    /// stay correct for all directions so nodes are ready when the player turns.
+    /// Currently retained for diagnostics / future reuse — CollectJobs no
+    /// longer culls by frustum here, because doing so left chunks behind the
+    /// camera unmeshed and made them flicker into existence the moment the
+    /// player turned around. Unity's renderer-level frustum culling still
+    /// skips draw calls for off-screen meshes for free.
     /// </summary>
     [HideInInspector] public Plane[] frustumPlanes;
 
@@ -129,6 +131,10 @@ public class Octree : MonoBehaviour
         int creations = 0;
         Traverse(root, playerPos, ref creations);
         CollectJobs(root, jobList, playerPos);
+        // Decide which nodes in the tree are actually rendered this frame.
+        // Done after CollectJobs so a job that just finished applying its
+        // mesh is reflected in CanCover() immediately on the same frame.
+        if (root != null) root.UpdateVisibility();
     }
 
     public void Shutdown()
@@ -170,7 +176,14 @@ public class Octree : MonoBehaviour
             {
                 if (node.children == null)
                 {
-                    node.Clear();
+                    // IMPORTANT: do NOT clear the parent's mesh here.
+                    //
+                    // The parent's mesh is the only thing that prevents a
+                    // visible hole while the 8 newly-created children are
+                    // being meshed asynchronously. Node.UpdateVisibility()
+                    // will keep rendering the parent until every child's
+                    // CanCover() returns true, then atomically swap to the
+                    // children. That gives a flicker-free LOD transition.
                     node.children = new Node[8];
                     for (int i = 0; i < 8; i++)
                         node.children[i] = new Node(this, node, Tables.Offsets[i], node.divisions - 1);
@@ -181,6 +194,10 @@ public class Octree : MonoBehaviour
             {
                 if (node.children != null)
                 {
+                    // Ask the parent to refresh its mesh in the background
+                    // (in case child-level player modifications need to be
+                    // reflected at coarser LOD). The parent's existing mesh
+                    // stays visible during the refresh — see Node.MarkDirty.
                     node.MarkDirty();
                     DeleteChildren(node);
                 }
@@ -256,10 +273,21 @@ public class Octree : MonoBehaviour
 
     private void CollectJobs(Node node, List<OctreeGrid.PrioritizedJob> jobList, Vector3 playerPos)
     {
-        // ── Frustum culling ───────────────────────────────────────────────
-        // Skip entire subtree when AABB is fully outside camera frustum.
-        if (frustumPlanes != null && !IsAabbInFrustum(node)) return;
-
+        // ── Frustum culling: REMOVED ON PURPOSE ──────────────────────────
+        //
+        // Earlier versions skipped the entire subtree when its AABB sat
+        // outside the camera frustum. That caused the camera-rotation flicker:
+        // chunks behind the player never got their mesh built, and the
+        // moment the player turned around all of them had to be scheduled
+        // and meshed from scratch — visible as "all octrees unloading and
+        // having to reload" the moment you look back.
+        //
+        // We now mesh every node that needs to be meshed, regardless of
+        // camera direction. Unity's per-mesh frustum culling still skips
+        // the actual draw calls, and the OctreeGrid budget keeps total
+        // work bounded. Sorting by sqrDistToPlayer below already biases
+        // scheduling toward what the player can see right now.
+        //
         // ── Underground culling below guaranteed-surface threshold ───────
         // Skip nodes completely below the configured cull altitude.
         // This avoids meshing deep underground volumes that are enclosed by
@@ -284,23 +312,6 @@ public class Octree : MonoBehaviour
         if (node.children == null) return;
         for (int i = 0; i < node.children.Length; i++)
             CollectJobs(node.children[i], jobList, playerPos);
-    }
-
-    /// <summary>
-    /// Returns true if the node's world-space AABB intersects or is inside
-    /// the camera frustum. Returns false only when the box is fully outside
-    /// at least one frustum plane — meaning nothing in the subtree is visible.
-    ///
-    /// We expand the test radius by 10% so nodes whose geometry slightly
-    /// extends past the calculated AABB (due to voxel rounding) are never
-    /// incorrectly culled at the screen edge.
-    /// </summary>
-    private bool IsAabbInFrustum(Node node)
-    {
-        Vector3 center = node.NodePosition();
-        float half = node.NodeScale() * 0.5f * 1.1f; // 10% expansion
-        var bounds = new Bounds(center, Vector3.one * (half * 2f));
-        return GeometryUtility.TestPlanesAABB(frustumPlanes, bounds);
     }
 
     // -----------------------------------------------------------------------

@@ -534,6 +534,7 @@ MonoBehaviour:
   terrainLayer:
     serializedVersion: 2
     m_Bits: 4294967295
+  maxImmediateJobsPerClick: 1
 --- !u!1 &1650284249
 GameObject:
   m_ObjectHideFlags: 0
@@ -576,7 +577,7 @@ MonoBehaviour:
   caveNoiseThreshold: 0.55
   caveNoiseAmplitudeY: 0.4
   caveSurfaceFadeRange: 20
-  divisions: 6
+  divisions: 7
   chunkResolution: 32
   lodDistanceCurve:
     serializedVersion: 2
@@ -614,8 +615,33 @@ MonoBehaviour:
   verticalLodBias: 3
   renderRadius: 7
   maxJobsPerFrame: 60
+  targetMeshingBudgetMs: 4
+  minJobsPerFrame: 2
+  maxSchedulesPerFrame: 24
+  maxInFlightJobs: 96
+  completeBudgetMs: 2.5
+  maxCompletionsPerFrame: 24
+  maxInteractiveCompletionsPerFrame: 8
+  logMeshingRuntime: 0
+  meshingLogInterval: 0.5
+  logInFlightSaturationWarnings: 1
+  saturationWarningInterval: 1
+  showFpsCounter: 1
+  fpsSmoothing: 0.15
   newCellsPerFrame: 3
   maxNodeCreationsPerFrame: 50
+  enableUndergroundNodeCull: 0
+  undergroundSolidCullMargin: 10
+  cullEnclosedUndergroundFaces: 1
+  enclosedUndergroundFaceMargin: 2
+  useSurfaceShellOnCoarseLod: 1
+  surfaceShellMinDivisions: 6
+  disableSurfaceShellWhenUnderground: 1
+  undergroundShellDisableMargin: 8
+  cullUndergroundFacesOnCoarseLod: 0
+  coarseLodFaceCullMinDivisions: 4
+  coarseLodFaceCullMargin: 1.5
+  coarseLodMinSurfaceVoxels: 2
   predictionDistance: 3
   predictionSpeedThreshold: 20
   predictionStrength: 1

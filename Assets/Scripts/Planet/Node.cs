@@ -19,10 +19,7 @@ public class Node
     public bool IsScheduled => isScheduled;
     private bool isScheduled = false;
     private bool needsDrawn = true;
-
-    private NativeArray<int3> modKeys;
-    private NativeArray<byte> modValues;
-    private NativeArray<GeologicalLayerBlob> geoLayers;
+    private int meshRevision = 0;
 
     // -----------------------------------------------------------------------
 
@@ -62,21 +59,22 @@ public class Node
         meshFilter.mesh = null;
         if (meshCollider != null) meshCollider.sharedMesh = null;
         needsDrawn = true;
+        // Invalidate any in-flight job result for this node (e.g. when a parent
+        // node is cleared due to subdivision) so stale coarse meshes cannot be
+        // applied later on top of detailed children.
+        meshRevision++;
     }
 
     public void MarkDirty()
     {
-        meshFilter.mesh = null;
-        if (meshCollider != null) meshCollider.sharedMesh = null;
+        // Keep the current mesh visible until the refreshed mesh is ready.
+        // This avoids one-frame unload/load flicker around interactions.
         needsDrawn = true;
-        isScheduled = false;
+        meshRevision++;
     }
 
     public void Destroy()
     {
-        if (modKeys.IsCreated) modKeys.Dispose();
-        if (modValues.IsCreated) modValues.Dispose();
-        if (geoLayers.IsCreated) geoLayers.Dispose();
         GameObject.Destroy(gameObject);
     }
 
@@ -102,8 +100,8 @@ public class Node
         var bounds = new Bounds(Vector3.zero, Vector3.one * NodeScale());
         var nodePos = NodePosition();
 
-        BuildModificationArrays(nodePos, NodeScale(), out modKeys, out modValues);
-        BuildGeoLayersArray(out geoLayers);
+        BuildModificationArrays(nodePos, NodeScale(), out NativeArray<int3> jobModKeys, out NativeArray<byte> jobModValues);
+        BuildGeoLayersArray(out NativeArray<GeologicalLayerBlob> jobGeoLayers);
 
         var job = new NodeJob
         {
@@ -135,10 +133,11 @@ public class Node
             chunkResolution = octree.chunkResolution,
             nodeScale = NodeScale(),
             worldNodePosition = nodePos,
-            modKeys = modKeys,
-            modValues = modValues,
-            geoLayers = geoLayers,
+            modKeys = jobModKeys,
+            modValues = jobModValues,
+            geoLayers = jobGeoLayers,
         };
+        int scheduledRevision = meshRevision;
 
         // Mark as in-flight so we don't double-collect this frame
         isScheduled = true;
@@ -154,6 +153,29 @@ public class Node
             // onComplete — apply finished mesh (main thread, after CompleteAll)
             onComplete: () =>
             {
+                if (scheduledRevision != meshRevision)
+                {
+                    meshDataArray.Dispose();
+                    isScheduled = false;
+                    needsDrawn = true;
+                    if (jobModKeys.IsCreated) jobModKeys.Dispose();
+                    if (jobModValues.IsCreated) jobModValues.Dispose();
+                    if (jobGeoLayers.IsCreated) jobGeoLayers.Dispose();
+                    return;
+                }
+
+                if (capturedFilter == null)
+                {
+                    // Node/object was destroyed before completion.
+                    meshDataArray.Dispose();
+                    isScheduled = false;
+                    needsDrawn = false;
+                    if (jobModKeys.IsCreated) jobModKeys.Dispose();
+                    if (jobModValues.IsCreated) jobModValues.Dispose();
+                    if (jobGeoLayers.IsCreated) jobGeoLayers.Dispose();
+                    return;
+                }
+
                 var mesh = new Mesh { name = "node_mesh", bounds = bounds };
                 Mesh.ApplyAndDisposeWritableMeshData(meshDataArray, mesh);
                 // Normals are written per-face inside NodeJob (Tables.Normals[side])
@@ -162,9 +184,9 @@ public class Node
                 capturedFilter.mesh = mesh;
                 if (capturedCollider != null) capturedCollider.sharedMesh = mesh;
                 isScheduled = false;
-                if (modKeys.IsCreated) modKeys.Dispose();
-                if (modValues.IsCreated) modValues.Dispose();
-                if (geoLayers.IsCreated) geoLayers.Dispose();
+                if (jobModKeys.IsCreated) jobModKeys.Dispose();
+                if (jobModValues.IsCreated) jobModValues.Dispose();
+                if (jobGeoLayers.IsCreated) jobGeoLayers.Dispose();
             },
 
             // cancel — budget dropped this job; free resources and reset so
@@ -172,11 +194,13 @@ public class Node
             cancel: () =>
             {
                 meshDataArray.Dispose();
-                if (modKeys.IsCreated) modKeys.Dispose();
-                if (modValues.IsCreated) modValues.Dispose();
-                if (geoLayers.IsCreated) geoLayers.Dispose();
+                if (jobModKeys.IsCreated) jobModKeys.Dispose();
+                if (jobModValues.IsCreated) jobModValues.Dispose();
+                if (jobGeoLayers.IsCreated) jobGeoLayers.Dispose();
                 isScheduled = false;
-                needsDrawn = true;   // will be re-collected next frame
+                // If the node changed while this job was pending/running, keep
+                // it dirty so a newer job is collected next frame.
+                needsDrawn = true;
             }
         );
 

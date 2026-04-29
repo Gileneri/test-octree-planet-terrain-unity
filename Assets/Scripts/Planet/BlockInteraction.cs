@@ -58,6 +58,9 @@ public class BlockInteraction : MonoBehaviour
     [Tooltip("Layers que contam como terreno.")]
     public LayerMask terrainLayer = ~0;
 
+    [Tooltip("How many interaction jobs are completed immediately on click.")]
+    public int maxImmediateJobsPerClick = 1;
+
     // Nudge dentro/fora da face para acertar o voxel correto
     private const float NudgeInto = 0.01f;
     private const float NudgeOut = 0.99f;
@@ -182,9 +185,8 @@ public class BlockInteraction : MonoBehaviour
     }
 
     /// <summary>
-    /// Collects, schedules, completes and applies mesh jobs for the given
-    /// nodes immediately — within the same frame as the player's click.
-    /// This mirrors what OctreeGrid.LateUpdate does but only for these nodes.
+    /// Collects interaction jobs and feeds them to OctreeGrid with priority.
+    /// Optionally flushes a tiny immediate batch to keep click feedback snappy.
     /// </summary>
     private void FlushNodes(Node[] nodes, int count)
     {
@@ -200,19 +202,26 @@ public class BlockInteraction : MonoBehaviour
 
         if (jobCount == 0) return;
 
-        // Schedule all in one batch (maximises Burst parallelism)
-        var handles = new Unity.Collections.NativeArray<Unity.Jobs.JobHandle>(
-            jobCount, Unity.Collections.Allocator.Temp);
+        int immediateCount = Mathf.Clamp(maxImmediateJobsPerClick, 0, jobCount);
+        if (immediateCount > 0)
+        {
+            var handles = new Unity.Collections.NativeArray<Unity.Jobs.JobHandle>(
+                immediateCount, Unity.Collections.Allocator.Temp);
 
-        for (int i = 0; i < jobCount; i++)
-            handles[i] = completers[i].schedule();
+            for (int i = 0; i < immediateCount; i++)
+                handles[i] = completers[i].schedule();
 
-        Unity.Jobs.JobHandle.CompleteAll(handles);
-        handles.Dispose();
+            Unity.Jobs.JobHandle.CompleteAll(handles);
+            handles.Dispose();
 
-        // Apply finished meshes on the main thread
-        for (int i = 0; i < jobCount; i++)
-            completers[i].onComplete();
+            for (int i = 0; i < immediateCount; i++)
+                completers[i].onComplete();
+        }
+
+        // Remaining jobs are queued as interactive so OctreeGrid prioritises
+        // them in the incremental completion pipeline.
+        for (int i = immediateCount; i < jobCount; i++)
+            octreeGrid.EnqueueInteractiveJob(completers[i]);
     }
 
     // -----------------------------------------------------------------------

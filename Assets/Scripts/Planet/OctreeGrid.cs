@@ -117,6 +117,21 @@ public class OctreeGrid : MonoBehaviour
     [Tooltip("Lower bound of jobs completed per frame.")]
     public int minJobsPerFrame = 2;
 
+    [Tooltip("Max jobs scheduled into Burst per frame.")]
+    public int maxSchedulesPerFrame = 24;
+
+    [Tooltip("Max jobs kept in-flight at once.")]
+    public int maxInFlightJobs = 96;
+
+    [Tooltip("Main-thread budget (ms) to complete/apply finished jobs each frame.")]
+    public float completeBudgetMs = 2.5f;
+
+    [Tooltip("Hard cap of completed jobs per frame.")]
+    public int maxCompletionsPerFrame = 24;
+
+    [Tooltip("Guaranteed cap reserved for interaction jobs per frame.")]
+    public int maxInteractiveCompletionsPerFrame = 8;
+
     [Tooltip("New octree cells activated per frame when player moves.")]
     public int newCellsPerFrame = 3;
 
@@ -176,6 +191,8 @@ public class OctreeGrid : MonoBehaviour
         = new Dictionary<Vector2Int, Octree>();
     private readonly Queue<Vector2Int> pendingCells = new Queue<Vector2Int>();
     private readonly List<PrioritizedJob> frameJobs = new List<PrioritizedJob>();
+    private readonly List<JobCompleter> interactivePendingJobs = new List<JobCompleter>();
+    private readonly List<ScheduledJob> inFlightJobs = new List<ScheduledJob>();
 
     private float cellSize;
     private Vector2Int lastPlayerCell = new Vector2Int(int.MaxValue, int.MaxValue);
@@ -191,6 +208,7 @@ public class OctreeGrid : MonoBehaviour
     // Frustum planes extracted once per frame and shared with all octrees
     private Plane[] frustumPlanes;
     private readonly Stopwatch _meshingStopwatch = new Stopwatch();
+    private readonly Stopwatch _completeStopwatch = new Stopwatch();
     private int _dynamicJobsPerFrame;
     private float _emaJobCostMs = 0f;
     private const float SpikeCutoffMultiplier = 1.75f;
@@ -203,6 +221,13 @@ public class OctreeGrid : MonoBehaviour
     {
         public JobCompleter completer;
         public float sqrDistToPlayer;
+    }
+
+    private struct ScheduledJob
+    {
+        public JobHandle handle;
+        public JobCompleter completer;
+        public bool interactive;
     }
 
     // -----------------------------------------------------------------------
@@ -274,36 +299,19 @@ public class OctreeGrid : MonoBehaviour
 
     private void LateUpdate()
     {
-        if (frameJobs.Count == 0) return;
-
         _meshingStopwatch.Restart();
-
-        frameJobs.Sort((a, b) => a.sqrDistToPlayer.CompareTo(b.sqrDistToPlayer));
-
         int clampedMinJobs = Mathf.Clamp(minJobsPerFrame, 1, Mathf.Max(1, maxJobsPerFrame));
         int clampedMaxJobs = Mathf.Max(clampedMinJobs, maxJobsPerFrame);
-        int jobBudget = Mathf.Clamp(_dynamicJobsPerFrame, clampedMinJobs, clampedMaxJobs);
-        int count = Mathf.Min(frameJobs.Count, jobBudget);
-
-        var handles = new NativeArray<JobHandle>(count, Allocator.Temp);
-        for (int i = 0; i < count; i++)
-            handles[i] = frameJobs[i].completer.schedule();
-        JobHandle.CompleteAll(handles);
-        handles.Dispose();
-
-        for (int i = 0; i < count; i++)
-            frameJobs[i].completer.onComplete();
-
-        for (int i = count; i < frameJobs.Count; i++)
-            frameJobs[i].completer.cancel?.Invoke();
-
-        frameJobs.Clear();
+        int dynamicScheduleBudget = Mathf.Clamp(_dynamicJobsPerFrame, clampedMinJobs, clampedMaxJobs);
+        int scheduledCount = ScheduleJobs(dynamicScheduleBudget);
+        int completedCount = CompleteFinishedJobs();
 
         _meshingStopwatch.Stop();
         float frameMeshingMs = (float)_meshingStopwatch.Elapsed.TotalMilliseconds;
-        if (count > 0)
+        if (completedCount > 0)
         {
-            float jobCostMs = frameMeshingMs / count;
+            float completeMs = (float)_completeStopwatch.Elapsed.TotalMilliseconds;
+            float jobCostMs = completeMs / completedCount;
             _emaJobCostMs = _emaJobCostMs <= 0f ? jobCostMs : Mathf.Lerp(_emaJobCostMs, jobCostMs, 0.2f);
 
             if (_emaJobCostMs > 0f)
@@ -315,18 +323,34 @@ public class OctreeGrid : MonoBehaviour
 
         // React immediately to spikes (EMA alone reacts too slowly).
         float spikeCutoffMs = Mathf.Max(1f, targetMeshingBudgetMs) * SpikeCutoffMultiplier;
-        if (frameMeshingMs > spikeCutoffMs && jobBudget > clampedMinJobs)
+        if (frameMeshingMs > spikeCutoffMs && dynamicScheduleBudget > clampedMinJobs)
         {
-            int droppedBudget = Mathf.FloorToInt(jobBudget * SpikeBudgetDropFactor);
+            int droppedBudget = Mathf.FloorToInt(dynamicScheduleBudget * SpikeBudgetDropFactor);
             _dynamicJobsPerFrame = Mathf.Clamp(droppedBudget, clampedMinJobs, clampedMaxJobs);
         }
 
         if (_meshingStopwatch.ElapsedMilliseconds > 5)
-            UnityEngine.Debug.Log($"[OctreeGrid] meshing {_meshingStopwatch.ElapsedMilliseconds} ms  jobs={count}  budget={jobBudget}  next={_dynamicJobsPerFrame}");
+            UnityEngine.Debug.Log($"[OctreeGrid] meshing {_meshingStopwatch.ElapsedMilliseconds} ms  scheduled={scheduledCount} completed={completedCount} inFlight={inFlightJobs.Count} interactivePending={interactivePendingJobs.Count} next={_dynamicJobsPerFrame}");
     }
 
     private void OnDestroy()
     {
+        for (int i = interactivePendingJobs.Count - 1; i >= 0; i--)
+            interactivePendingJobs[i].cancel?.Invoke();
+        interactivePendingJobs.Clear();
+
+        for (int i = frameJobs.Count - 1; i >= 0; i--)
+            frameJobs[i].completer.cancel?.Invoke();
+        frameJobs.Clear();
+
+        for (int i = inFlightJobs.Count - 1; i >= 0; i--)
+        {
+            var job = inFlightJobs[i];
+            job.handle.Complete();
+            job.completer.cancel?.Invoke();
+        }
+        inFlightJobs.Clear();
+
         foreach (var octree in activeCells.Values)
             octree.Shutdown();
         activeCells.Clear();
@@ -336,7 +360,7 @@ public class OctreeGrid : MonoBehaviour
     private void OnGUI()
     {
         GUILayout.Label($"World: {worldSizeX} × {worldSizeZ} units  (toroidal)");
-        GUILayout.Label($"Active cells: {activeCells.Count}  Pending: {pendingCells.Count}  Jobs: {frameJobs.Count}");
+        GUILayout.Label($"Active cells: {activeCells.Count}  Pending: {pendingCells.Count}  Jobs: collect={frameJobs.Count} interactive={interactivePendingJobs.Count} inFlight={inFlightJobs.Count}");
         GUILayout.Label($"Meshing budget: current={_dynamicJobsPerFrame} targetMs={targetMeshingBudgetMs:F1} avgJobMs={_emaJobCostMs:F2}");
         GUILayout.Label($"Underground node cull: {(enableUndergroundNodeCull ? $"ON belowY={_undergroundCullBelowY:F1}" : "OFF")}");
         GUILayout.Label($"Enclosed underground faces: {(cullEnclosedUndergroundFaces ? $"ON margin={enclosedUndergroundFaceMargin:F1}" : "OFF")}");
@@ -347,6 +371,109 @@ public class OctreeGrid : MonoBehaviour
                         $"Prediction: {(playerVelocity.magnitude > predictionSpeedThreshold ? "ON" : "off")}");
         if (WorldModifications.Instance != null)
             GUILayout.Label($"Modifications: {WorldModifications.Instance.Count}");
+    }
+
+    public void EnqueueInteractiveJob(JobCompleter completer)
+    {
+        if (completer == null) return;
+        interactivePendingJobs.Add(completer);
+    }
+
+    private int ScheduleJobs(int dynamicScheduleBudget)
+    {
+        int scheduleBudget = Mathf.Max(0, Mathf.Min(maxSchedulesPerFrame, dynamicScheduleBudget));
+        int availableInFlight = Mathf.Max(0, maxInFlightJobs - inFlightJobs.Count);
+        int toSchedule = Mathf.Min(scheduleBudget, availableInFlight);
+        int scheduled = 0;
+
+        while (scheduled < toSchedule && interactivePendingJobs.Count > 0)
+        {
+            var completer = interactivePendingJobs[0];
+            interactivePendingJobs.RemoveAt(0);
+            inFlightJobs.Add(new ScheduledJob
+            {
+                handle = completer.schedule(),
+                completer = completer,
+                interactive = true,
+            });
+            scheduled++;
+        }
+
+        if (frameJobs.Count > 1)
+            frameJobs.Sort((a, b) => a.sqrDistToPlayer.CompareTo(b.sqrDistToPlayer));
+
+        int remaining = toSchedule - scheduled;
+        int normalCount = Mathf.Min(frameJobs.Count, remaining);
+        for (int i = 0; i < normalCount; i++)
+        {
+            var job = frameJobs[i];
+            inFlightJobs.Add(new ScheduledJob
+            {
+                handle = job.completer.schedule(),
+                completer = job.completer,
+                interactive = false,
+            });
+            scheduled++;
+        }
+
+        for (int i = normalCount; i < frameJobs.Count; i++)
+            frameJobs[i].completer.cancel?.Invoke();
+        frameJobs.Clear();
+
+        return scheduled;
+    }
+
+    private int CompleteFinishedJobs()
+    {
+        _completeStopwatch.Restart();
+        int completedTotal = 0;
+        int completedInteractive = 0;
+        int maxCompleted = Mathf.Max(1, maxCompletionsPerFrame);
+        int maxInteractive = Mathf.Max(0, maxInteractiveCompletionsPerFrame);
+        float budgetMs = Mathf.Max(0.1f, completeBudgetMs);
+
+        bool budgetExceeded = false;
+        for (int pass = 0; pass < 2 && !budgetExceeded; pass++)
+        {
+            for (int i = inFlightJobs.Count - 1; i >= 0; i--)
+            {
+                if (_completeStopwatch.Elapsed.TotalMilliseconds >= budgetMs ||
+                    completedTotal >= maxCompleted)
+                {
+                    budgetExceeded = true;
+                    break;
+                }
+
+                var scheduled = inFlightJobs[i];
+                if (pass == 0)
+                {
+                    if (!scheduled.interactive || completedInteractive >= maxInteractive)
+                        continue;
+                }
+                else if (scheduled.interactive)
+                {
+                    continue;
+                }
+
+                if (!scheduled.handle.IsCompleted) continue;
+
+                scheduled.handle.Complete();
+                scheduled.completer.onComplete();
+                SwapBackRemove(inFlightJobs, i);
+                completedTotal++;
+                if (scheduled.interactive) completedInteractive++;
+            }
+        }
+
+        _completeStopwatch.Stop();
+        return completedTotal;
+    }
+
+    private static void SwapBackRemove<T>(List<T> list, int index)
+    {
+        int last = list.Count - 1;
+        list[index] = list[last];
+        list.RemoveAt(last);
     }
 
     private void OnDrawGizmos()

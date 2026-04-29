@@ -132,6 +132,26 @@ public class OctreeGrid : MonoBehaviour
     [Tooltip("Guaranteed cap reserved for interaction jobs per frame.")]
     public int maxInteractiveCompletionsPerFrame = 8;
 
+    [Header("Meshing Logs")]
+    [Tooltip("Enable detailed meshing runtime logs.")]
+    public bool logMeshingRuntime = false;
+
+    [Tooltip("Minimum interval between meshing runtime logs (seconds).")]
+    public float meshingLogInterval = 0.5f;
+
+    [Tooltip("Warn when in-flight queue stays saturated.")]
+    public bool logInFlightSaturationWarnings = true;
+
+    [Tooltip("Minimum interval between saturation warnings (seconds).")]
+    public float saturationWarningInterval = 1.0f;
+
+    [Header("HUD")]
+    [Tooltip("Show runtime FPS counter in play mode.")]
+    public bool showFpsCounter = true;
+
+    [Tooltip("Smoothing speed for the FPS counter.")]
+    public float fpsSmoothing = 0.15f;
+
     [Tooltip("New octree cells activated per frame when player moves.")]
     public int newCellsPerFrame = 3;
 
@@ -156,7 +176,13 @@ public class OctreeGrid : MonoBehaviour
     public bool useSurfaceShellOnCoarseLod = true;
 
     [Tooltip("Apply surface-shell approximation only on nodes with divisions >= this value.")]
-    public int surfaceShellMinDivisions = 4;
+    public int surfaceShellMinDivisions = 6;
+
+    [Tooltip("Disable coarse surface-shell while player is underground (based on local surface estimate).")]
+    public bool disableSurfaceShellWhenUnderground = true;
+
+    [Tooltip("Player must be this far below estimated local surface to disable shell.")]
+    public float undergroundShellDisableMargin = 8f;
 
     [Tooltip("On coarse LOD nodes, hide underground faces below local surface (surface shell approximation).")]
     public bool cullUndergroundFacesOnCoarseLod = false;
@@ -214,6 +240,11 @@ public class OctreeGrid : MonoBehaviour
     private const float SpikeCutoffMultiplier = 1.75f;
     private const float SpikeBudgetDropFactor = 0.6f;
     private float _undergroundCullBelowY;
+    private float _nextMeshingLogTime = 0f;
+    private float _nextSaturationWarningTime = 0f;
+    private FastNoiseLite _runtimeSurfaceNoise;
+    private bool _surfaceShellActiveThisFrame = true;
+    private float _smoothedDeltaTime = 0.016f;
 
     // -----------------------------------------------------------------------
 
@@ -247,6 +278,7 @@ public class OctreeGrid : MonoBehaviour
 
         BakeLodRadii();
         ComputeMaxColliderDivisions();
+        InitializeRuntimeSurfaceNoise();
 
         UnityEngine.Debug.Log($"[OctreeGrid] cellSize={cellSize}  renderRadius={renderRadius}  " +
                   $"grid={(renderRadius * 2 + 1)}×{(renderRadius * 2 + 1)}  " +
@@ -264,6 +296,9 @@ public class OctreeGrid : MonoBehaviour
 
     private void Update()
     {
+        float dt = Mathf.Max(0.0001f, Time.unscaledDeltaTime);
+        _smoothedDeltaTime = Mathf.Lerp(_smoothedDeltaTime, dt, Mathf.Clamp01(fpsSmoothing));
+
         Vector3 rawVelocity = (priority.position - prevPlayerPos) / Time.deltaTime;
         playerVelocity = Vector3.Lerp(playerVelocity, rawVelocity, VelocitySmooth);
         prevPlayerPos = priority.position;
@@ -292,9 +327,13 @@ public class OctreeGrid : MonoBehaviour
             : null;
 
         RecomputeUndergroundCullBelowY();
+        _surfaceShellActiveThisFrame = ComputeSurfaceShellActive(priority.position);
 
         foreach (var octree in activeCells.Values)
+        {
+            octree.useSurfaceShellOnCoarseLod = _surfaceShellActiveThisFrame;
             octree.Tick(frameJobs, priority.position, frustumPlanes, _undergroundCullBelowY);
+        }
     }
 
     private void LateUpdate()
@@ -329,8 +368,24 @@ public class OctreeGrid : MonoBehaviour
             _dynamicJobsPerFrame = Mathf.Clamp(droppedBudget, clampedMinJobs, clampedMaxJobs);
         }
 
-        if (_meshingStopwatch.ElapsedMilliseconds > 5)
+        if (logMeshingRuntime &&
+            _meshingStopwatch.ElapsedMilliseconds > 5 &&
+            Time.unscaledTime >= _nextMeshingLogTime)
+        {
+            _nextMeshingLogTime = Time.unscaledTime + Mathf.Max(0.1f, meshingLogInterval);
             UnityEngine.Debug.Log($"[OctreeGrid] meshing {_meshingStopwatch.ElapsedMilliseconds} ms  scheduled={scheduledCount} completed={completedCount} inFlight={inFlightJobs.Count} interactivePending={interactivePendingJobs.Count} next={_dynamicJobsPerFrame}");
+        }
+
+        if (logInFlightSaturationWarnings &&
+            inFlightJobs.Count >= maxInFlightJobs &&
+            (interactivePendingJobs.Count > 0 || frameJobs.Count > 0) &&
+            Time.unscaledTime >= _nextSaturationWarningTime)
+        {
+            _nextSaturationWarningTime = Time.unscaledTime + Mathf.Max(0.25f, saturationWarningInterval);
+            UnityEngine.Debug.LogWarning(
+                $"[OctreeGrid] in-flight saturated ({inFlightJobs.Count}/{maxInFlightJobs}) " +
+                $"interactivePending={interactivePendingJobs.Count} collectPending={frameJobs.Count}");
+        }
     }
 
     private void OnDestroy()
@@ -359,12 +414,19 @@ public class OctreeGrid : MonoBehaviour
 
     private void OnGUI()
     {
+        if (showFpsCounter)
+        {
+            float fps = 1f / Mathf.Max(0.0001f, _smoothedDeltaTime);
+            float frameMs = _smoothedDeltaTime * 1000f;
+            GUILayout.Label($"FPS: {fps:F1}  Frame: {frameMs:F2} ms");
+        }
+
         GUILayout.Label($"World: {worldSizeX} × {worldSizeZ} units  (toroidal)");
         GUILayout.Label($"Active cells: {activeCells.Count}  Pending: {pendingCells.Count}  Jobs: collect={frameJobs.Count} interactive={interactivePendingJobs.Count} inFlight={inFlightJobs.Count}");
         GUILayout.Label($"Meshing budget: current={_dynamicJobsPerFrame} targetMs={targetMeshingBudgetMs:F1} avgJobMs={_emaJobCostMs:F2}");
         GUILayout.Label($"Underground node cull: {(enableUndergroundNodeCull ? $"ON belowY={_undergroundCullBelowY:F1}" : "OFF")}");
         GUILayout.Label($"Enclosed underground faces: {(cullEnclosedUndergroundFaces ? $"ON margin={enclosedUndergroundFaceMargin:F1}" : "OFF")}");
-        GUILayout.Label($"Surface shell coarse: {(useSurfaceShellOnCoarseLod ? $"ON minDiv={surfaceShellMinDivisions}" : "OFF")}");
+        GUILayout.Label($"Surface shell coarse: {(_surfaceShellActiveThisFrame ? $"ON minDiv={surfaceShellMinDivisions}" : "OFF (underground)")}");
         GUILayout.Label($"Coarse underground faces: {(cullUndergroundFacesOnCoarseLod ? $"ON minDiv={coarseLodFaceCullMinDivisions} margin={coarseLodFaceCullMargin:F1} minSurfaceVox={coarseLodMinSurfaceVoxels}" : "OFF")}");
         GUILayout.Label($"Player: {priority.position}");
         GUILayout.Label($"Speed: {playerVelocity.magnitude:F1} u/s  " +
@@ -715,6 +777,56 @@ public class OctreeGrid : MonoBehaviour
 
         float lowestPossibleSurfaceY = surfaceBaseHeight - Mathf.Abs(surfaceNoiseAmplitude);
         _undergroundCullBelowY = lowestPossibleSurfaceY - Mathf.Max(0f, undergroundSolidCullMargin);
+    }
+
+    private void InitializeRuntimeSurfaceNoise()
+    {
+        _runtimeSurfaceNoise = new FastNoiseLite();
+        _runtimeSurfaceNoise.SetSeed(noiseSeed);
+        _runtimeSurfaceNoise.SetFrequency(0.003f);
+        switch (noiseTypeId)
+        {
+            case 1: _runtimeSurfaceNoise.SetNoiseType(FastNoiseLite.NoiseType.OpenSimplex2S); break;
+            case 2: _runtimeSurfaceNoise.SetNoiseType(FastNoiseLite.NoiseType.Perlin); break;
+            default: _runtimeSurfaceNoise.SetNoiseType(FastNoiseLite.NoiseType.OpenSimplex2); break;
+        }
+    }
+
+    private bool ComputeSurfaceShellActive(Vector3 playerPos)
+    {
+        if (!useSurfaceShellOnCoarseLod) return false;
+        if (!disableSurfaceShellWhenUnderground) return true;
+
+        float estimatedSurfaceY = SampleSurfaceHeightAt(playerPos.x, playerPos.z);
+        return playerPos.y >= estimatedSurfaceY - Mathf.Max(0f, undergroundShellDisableMargin);
+    }
+
+    private float SampleSurfaceHeightAt(float worldX, float worldZ)
+    {
+        float wx = PosMod(worldX, worldSizeX);
+        float wz = PosMod(worldZ, worldSizeZ);
+
+        float aX = wx / worldSizeX * 2f * Mathf.PI;
+        float aZ = wz / worldSizeZ * 2f * Mathf.PI;
+        float rX = worldSizeX / (2f * Mathf.PI);
+        float rZ = worldSizeZ / (2f * Mathf.PI);
+
+        float cx = Mathf.Cos(aX) * rX;
+        float sx = Mathf.Sin(aX) * rX;
+        float cz = Mathf.Cos(aZ) * rZ;
+        float sz = Mathf.Sin(aZ) * rZ;
+
+        float n1 = _runtimeSurfaceNoise.GetNoise(cx, sx, cz);
+        float n2 = _runtimeSurfaceNoise.GetNoise(cz + 100f, sz + 100f, cx * 0.5f);
+        float n3 = _runtimeSurfaceNoise.GetNoise(sx * 0.7f, sz * 0.7f + 200f, cz * 0.3f);
+
+        return surfaceBaseHeight + (n1 * 0.6f + n2 * 0.3f + n3 * 0.1f) * surfaceNoiseAmplitude;
+    }
+
+    private static float PosMod(float x, float m)
+    {
+        float r = x % m;
+        return r < 0f ? r + m : r;
     }
 
     // -----------------------------------------------------------------------

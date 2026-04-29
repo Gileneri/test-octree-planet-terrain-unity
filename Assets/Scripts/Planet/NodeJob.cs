@@ -94,6 +94,16 @@ public struct NodeJob : IJob
     public float coarseLodFaceCullMargin;
     public int coarseLodMinSurfaceVoxels;
 
+    /// <summary>
+    /// When true the greedy mesher caps each merged quad at ~350 world units
+    /// per side so PhysX doesn't complain about >500u triangles on the
+    /// MeshCollider. Set false on coarse render-only nodes (no collider) to
+    /// let greedy merge as aggressively as possible — those meshes never
+    /// touch PhysX so the warning isn't a concern, and full merging keeps
+    /// distant-LOD vertex counts minimal.
+    /// </summary>
+    public bool capGreedyForCollider;
+
     // ── Private ───────────────────────────────────────────────────────────
     private float3 centerOffset;
     private float normalizedVoxelScale;
@@ -344,6 +354,40 @@ public struct NodeJob : IJob
         var mask = new NativeArray<byte>(chunkResolution * chunkResolution,
             Allocator.Temp, NativeArrayOptions.UninitializedMemory);
 
+        // ── Greedy merge cap ──────────────────────────────────────────────
+        //
+        // PhysX's MeshCollider cooker logs a warning whenever any single
+        // triangle has two vertices more than 500 world units apart, and
+        // those huge triangles also cause unstable raycasts/queries. With
+        // chunkResolution=32 a fully merged floor face can easily be
+        // 1024 × 1024 units (diagonal ≈ 1448u) on coarse-but-still-collided
+        // LODs, which is precisely what triggered the warnings.
+        //
+        // We cap each greedy quad to at most ~350u per side, so the
+        // diagonal of a square quad stays under √2 × 350 ≈ 495u — safely
+        // below the 500u limit even for the worst (square) merge case.
+        // The cap is expressed in voxels relative to this chunk's voxel
+        // scale, and is at least 1 (otherwise small-voxel chunks would
+        // emit no faces at all).
+        //
+        // The visual impact is essentially zero: the texture still tiles
+        // per voxel via the per-voxel UV scaling, so a 10×10 quad looks
+        // the same as 100 individual 1×1 quads. We simply produce a few
+        // more quads on coarse LODs in exchange for stable physics.
+        const float MaxQuadWorldDim = 350f;
+        int maxMergeDim;
+        if (capGreedyForCollider)
+        {
+            maxMergeDim = (int)math.floor(MaxQuadWorldDim / normalizedVoxelScale);
+            if (maxMergeDim < 1) maxMergeDim = 1;
+        }
+        else
+        {
+            // Render-only chunk: no PhysX cooking, so let greedy merge to
+            // its full chunk extent for minimum vertex count.
+            maxMergeDim = chunkResolution;
+        }
+
         for (int side = 0; side < 6; side++)
         {
             for (int slice = 0; slice < chunkResolution; slice++)
@@ -352,7 +396,7 @@ public struct NodeJob : IJob
                     applyCoarseUndergroundFaceCull, minSurfaceVoxelsToKeep,
                     ref surfaceNoise, ref caveNoise, borderNoises, applySurfaceShell);
 
-                GreedyEmitSlice(side, slice, mask,
+                GreedyEmitSlice(side, slice, mask, maxMergeDim,
                     vertices, normals, uvs, blockData, indices,
                     ref vi, ref ii);
             }
@@ -496,9 +540,11 @@ public struct NodeJob : IJob
     /// Greedy merges contiguous same-blockId cells in the mask into
     /// rectangular quads, emitting each merged region as a single quad
     /// with per-voxel UV tiling. Cells consumed by a merged quad are
-    /// zeroed out so they are not re-emitted.
+    /// zeroed out so they are not re-emitted. Both width and height are
+    /// capped at <paramref name="maxMergeDim"/> to keep generated
+    /// triangles within PhysX's safe size window (see Execute()).
     /// </summary>
-    private void GreedyEmitSlice(int side, int slice, NativeArray<byte> mask,
+    private void GreedyEmitSlice(int side, int slice, NativeArray<byte> mask, int maxMergeDim,
         NativeArray<float3> vertices, NativeArray<float3> normals,
         NativeArray<float2> uvs, NativeArray<float2> blockData,
         NativeArray<uint> indices,
@@ -514,14 +560,16 @@ public struct NodeJob : IJob
                 byte bid = mask[u * res + v];
                 if (bid == 0) { u++; continue; }
 
-                // Width: extend along u while the same blockId continues.
+                // Width: extend along u while the same blockId continues,
+                // bounded by the world-space cap to avoid >500u triangles.
                 int w = 1;
-                while (u + w < res && mask[(u + w) * res + v] == bid) w++;
+                while (u + w < res && w < maxMergeDim
+                       && mask[(u + w) * res + v] == bid) w++;
 
                 // Height: extend along v while every column in [u, u+w)
-                // still matches the same blockId on row v+h.
+                // still matches the same blockId on row v+h, also capped.
                 int h = 1;
-                while (v + h < res)
+                while (v + h < res && h < maxMergeDim)
                 {
                     bool rowOk = true;
                     for (int k = 0; k < w; k++)

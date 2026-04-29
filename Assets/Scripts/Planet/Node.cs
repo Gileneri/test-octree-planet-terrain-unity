@@ -68,6 +68,16 @@ public class Node
     private JobHandle pendingBakeHandle;
     private Mesh pendingBakeMesh;
 
+    /// <summary>
+    /// Set true once this Node has been Destroy()'d. Because the underlying
+    /// GameObject goes back to the chunk pool (instead of being destroyed),
+    /// any captured MeshFilter/MeshRenderer/MeshCollider references in a
+    /// pending job's onComplete lambda are STILL VALID — they would happily
+    /// stomp the mesh of whichever new Node has since recycled the GO.
+    /// onComplete checks this flag and returns early if the Node is gone.
+    /// </summary>
+    private bool destroyed = false;
+
     private int meshRevision = 0;
 
     // -----------------------------------------------------------------------
@@ -79,9 +89,18 @@ public class Node
         this.offset = offset;
         this.divisions = divisions;
 
-        gameObject = GameObject.Instantiate(octree.chunkPrefab);
+        // Pull a GameObject out of the chunk pool — Instantiate/Destroy at
+        // the rate this terrain churns chunks (hundreds per second while
+        // flying fast) is by far the biggest non-meshing CPU cost. The
+        // pool returns an already-Active instance; we just re-parent it.
+        gameObject = ChunkObjectPool.Acquire(octree.chunkPrefab);
+        // Mirror the original parenting policy: only attach to the
+        // parent node when one exists; the Octree root node stays at
+        // scene-root level the way it always has.
         if (parent != null)
-            gameObject.transform.parent = parent.gameObject.transform;
+            gameObject.transform.SetParent(parent.gameObject.transform, worldPositionStays: false);
+        else
+            gameObject.transform.SetParent(null, worldPositionStays: false);
 
         meshFilter = gameObject.GetComponent<MeshFilter>();
         meshRenderer = gameObject.GetComponent<MeshRenderer>();
@@ -194,6 +213,15 @@ public class Node
 
     public void Destroy()
     {
+        // Mark this Node as gone before doing any teardown so any in-flight
+        // job's onComplete lambda will short-circuit cleanly when it lands
+        // (necessary because the GameObject lives on inside the pool —
+        // otherwise the captured component refs would still look valid).
+        destroyed = true;
+        // Bump the mesh revision so any Octree-side equality checks that
+        // hold a stale revision number recognize this Node as superseded.
+        meshRevision++;
+
         // If a collider bake is still in flight we MUST wait for it before
         // destroying the mesh — Physics.BakeMesh references the mesh by
         // instanceID and would crash if Unity GC'd the mesh underneath it.
@@ -204,6 +232,15 @@ public class Node
             pendingBakeMesh = null;
         }
 
+        // Detach the mesh from the (potentially still-attached) MeshCollider
+        // BEFORE destroying it — leaving a destroyed Mesh referenced from a
+        // pooled MeshCollider would create a dangling reference that bites
+        // the next Node that recycles this GameObject.
+        if (meshCollider != null)
+            meshCollider.sharedMesh = null;
+        if (meshFilter != null)
+            meshFilter.mesh = null;
+
         // Mesh assets aren't auto-destroyed when the host GameObject dies —
         // they linger until a full GC, and after a few minutes of travel
         // that pile becomes a multi-second hitch. Free it explicitly.
@@ -213,7 +250,17 @@ public class Node
             appliedMesh = null;
         }
 
-        GameObject.Destroy(gameObject);
+        // Reset renderer to its default enabled state so the next Node
+        // that recycles this GameObject doesn't inherit a stale
+        // disabled renderer from the previous owner's UpdateVisibility.
+        if (meshRenderer != null)
+            meshRenderer.enabled = true;
+
+        // Hand the GameObject back to the pool instead of destroying it.
+        // This skips Object.Destroy + GC + the next Object.Instantiate,
+        // which together typically cost more than meshing a chunk does.
+        ChunkObjectPool.Release(gameObject);
+        gameObject = null;
     }
 
     /// <summary>
@@ -306,6 +353,9 @@ public class Node
             modKeys = jobModKeys,
             modValues = jobModValues,
             geoLayers = jobGeoLayers,
+            // Only chunks fine enough to host a MeshCollider need the
+            // greedy-merge cap. Render-only coarse chunks merge freely.
+            capGreedyForCollider = meshCollider != null,
         };
         int scheduledRevision = meshRevision;
 
@@ -324,23 +374,27 @@ public class Node
             // onComplete — apply finished mesh (main thread, after CompleteAll)
             onComplete: () =>
             {
-                if (scheduledRevision != meshRevision)
+                // Two ways the node can be gone by the time the job lands:
+                //  1. The owning GameObject was destroyed outright
+                //     (capturedFilter == null — Unity null check).
+                //  2. The Node was Destroy()'d but its GameObject was
+                //     returned to the chunk pool — the MeshFilter ref is
+                //     still alive (pointed at a now-recycled GO!), so we
+                //     must consult the explicit `destroyed` flag instead.
+                if (destroyed || capturedFilter == null)
                 {
                     meshDataArray.Dispose();
-                    isScheduled = false;
-                    needsDrawn = true;
                     if (jobModKeys.IsCreated) jobModKeys.Dispose();
                     if (jobModValues.IsCreated) jobModValues.Dispose();
                     if (jobGeoLayers.IsCreated) jobGeoLayers.Dispose();
                     return;
                 }
 
-                if (capturedFilter == null)
+                if (scheduledRevision != meshRevision)
                 {
-                    // Node/object was destroyed before completion.
                     meshDataArray.Dispose();
                     isScheduled = false;
-                    needsDrawn = false;
+                    needsDrawn = true;
                     if (jobModKeys.IsCreated) jobModKeys.Dispose();
                     if (jobModValues.IsCreated) jobModValues.Dispose();
                     if (jobGeoLayers.IsCreated) jobGeoLayers.Dispose();
@@ -419,6 +473,7 @@ public class Node
                 if (jobModKeys.IsCreated) jobModKeys.Dispose();
                 if (jobModValues.IsCreated) jobModValues.Dispose();
                 if (jobGeoLayers.IsCreated) jobGeoLayers.Dispose();
+                if (destroyed) return; // Node is gone — nothing to mark dirty.
                 isScheduled = false;
                 // If the node changed while this job was pending/running, keep
                 // it dirty so a newer job is collected next frame.

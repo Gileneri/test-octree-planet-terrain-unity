@@ -355,6 +355,11 @@ public class OctreeGrid : MonoBehaviour
             octree.Shutdown();
         activeCells.Clear();
         pendingCells.Clear();
+
+        // Drop pooled chunk GameObjects — keeping them across scene loads
+        // would resurrect references to objects whose underlying prefab
+        // and renderers belong to a now-destroyed scene.
+        ChunkObjectPool.Clear();
     }
 
     private void OnGUI()

@@ -9,10 +9,12 @@
     "minSubsurfaceHeight": -500.0,
     "divisions": 7,
     "chunkResolution": 32,
-    "cavesEnabled": false,
+    "cavesEnabled": true,
     "caveNoiseFrequency": 0.035999998450279239,
     "caveNoiseThreshold": 0.1599999964237213,
     "caveNoiseAmplitudeY": 1.350000023841858,
     "caveSurfaceFadeRange": 29.0,
+    "caveMaxDepth": 512.0,
+    "caveMaxDivisions": 2,
     "renderRadius": 7
 }

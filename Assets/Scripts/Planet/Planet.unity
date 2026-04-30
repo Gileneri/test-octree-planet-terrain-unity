@@ -577,6 +577,8 @@ MonoBehaviour:
   caveNoiseThreshold: 0.55
   caveNoiseAmplitudeY: 0.4
   caveSurfaceFadeRange: 20
+  caveMaxDepth: 512
+  caveMaxDivisions: 2
   divisions: 7
   chunkResolution: 32
   lodDistanceCurve:

@@ -111,6 +111,19 @@ public class WorldConfig : ScriptableObject
     [Tooltip("Y units below the surface over which caves fade in. Prevents caves punching through the ground.")]
     public float caveSurfaceFadeRange = 20f;
 
+    [Tooltip("Maximum depth (Y units below surface) where caves can carve voxels. " +
+             "Below this, the per-voxel cave noise sample is skipped — saves up to " +
+             "16 000 noise calls per chunk on a 32-resolution chunk. 0 = no cap (always sample). " +
+             "Default 256u is comfortably deeper than visually noticeable caves on typical terrain.")]
+    public float caveMaxDepth = 256f;
+
+    [Tooltip("Highest octree division level allowed to evaluate caves. divisions=1 is the finest LOD. " +
+             "Distant chunks (high division number) skip cave sampling entirely — caves aren't " +
+             "visible at distance and their noise is the dominant per-voxel cost. " +
+             "Set to 1–3 for best perf; higher values render caves at greater distances.")]
+    [Range(1, 12)]
+    public int caveMaxDivisions = 3;
+
     // ------------------------------------------------------------------
     // Geological Layers
     // ------------------------------------------------------------------
@@ -216,6 +229,8 @@ public class WorldConfig : ScriptableObject
         caveNoiseThreshold = p.caveNoiseThreshold;
         caveNoiseAmplitudeY = p.caveNoiseAmplitudeY;
         caveSurfaceFadeRange = p.caveSurfaceFadeRange;
+        caveMaxDepth = p.caveMaxDepth;
+        caveMaxDivisions = p.caveMaxDivisions;
         renderRadius = p.renderRadius;
     }
 
@@ -236,6 +251,8 @@ public class WorldConfig : ScriptableObject
         caveNoiseThreshold = caveNoiseThreshold,
         caveNoiseAmplitudeY = caveNoiseAmplitudeY,
         caveSurfaceFadeRange = caveSurfaceFadeRange,
+        caveMaxDepth = caveMaxDepth,
+        caveMaxDivisions = caveMaxDivisions,
         renderRadius = renderRadius,
     };
 
@@ -257,6 +274,14 @@ public class WorldConfig : ScriptableObject
         public float caveNoiseThreshold;
         public float caveNoiseAmplitudeY;
         public float caveSurfaceFadeRange;
+
+        // The two fields below were added later. JsonUtility respects field
+        // initializers for keys that are missing from older .json saves —
+        // these defaults preserve the previous "caves carve everywhere"
+        // behaviour for legacy files until the user re-saves.
+        public float caveMaxDepth = 256f;
+        public int caveMaxDivisions = 3;
+
         public int renderRadius;
     }
 }

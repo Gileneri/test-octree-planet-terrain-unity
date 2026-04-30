@@ -86,6 +86,8 @@ public class WorldConfigLoader : MonoBehaviour
         grid.caveNoiseThreshold = config.caveNoiseThreshold;
         grid.caveNoiseAmplitudeY = config.caveNoiseAmplitudeY;
         grid.caveSurfaceFadeRange = config.caveSurfaceFadeRange;
+        grid.caveMaxDepth = config.caveMaxDepth;
+        grid.caveMaxDivisions = config.caveMaxDivisions;
         grid.divisions = config.divisions;
         grid.chunkResolution = config.chunkResolution;
         grid.renderRadius = config.renderRadius;

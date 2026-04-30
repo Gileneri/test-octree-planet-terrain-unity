@@ -71,6 +71,23 @@ public struct NodeJob : IJob
     public float caveNoiseThreshold;    // typical 0.4–0.7 (higher = fewer caves)
     public float caveNoiseAmplitudeY;   // vertical squish, typical 0.3–0.6
     public float caveSurfaceFadeRange;  // Y units below surface where caves fade in
+
+    /// <summary>
+    /// Resolved per-chunk: true only when cavesEnabled, the LOD is fine
+    /// enough (nodeDivisions <= caveMaxDivisions), and the chunk's world
+    /// AABB actually overlaps the cave-active band. When false, every
+    /// per-voxel cave check inside SampleDensity is skipped — that's the
+    /// dominant Pass 1 cost on cave-enabled worlds.
+    /// </summary>
+    public bool applyCavesForChunk;
+
+    /// <summary>
+    /// Maximum depth below the local surface (in world Y units) where the
+    /// cave noise is allowed to carve. Beyond this depth voxels stay
+    /// solid and the cave noise sample is skipped per voxel. 0 disables
+    /// the cap (caves can carve at any depth, expensive).
+    /// </summary>
+    public float caveMaxDepth;
     public bool cullEnclosedUndergroundFaces;
     public float enclosedUndergroundFaceMargin;
     public bool useSurfaceShellOnCoarseLod;
@@ -806,18 +823,34 @@ public struct NodeJob : IJob
             return 0; // Air — above surface
 
         // ── Layer 3 : Caves ────────────────────────────────────────────────
-        if (cavesEnabled && !applySurfaceShell)
+        // applyCavesForChunk is resolved per-chunk in Execute(): it bundles
+        // cavesEnabled + the LOD-distance cap (caveMaxDivisions) + the
+        // chunk-AABB overlap with the cave-active band. When false this
+        // whole block is skipped — saves the OpenSimplex2 GetNoise() call
+        // for every below-surface voxel, which is the single most
+        // expensive thing in Pass 1 on cave-enabled worlds.
+        //
+        // Per-voxel we additionally respect:
+        //   • applySurfaceShell — coarse-LOD shell mode treats below-shell
+        //     voxels as opaque, so caves there would be wasted work.
+        //   • caveMaxDepth — caves only carve within this many units of
+        //     the local surface; below that voxels stay solid without
+        //     paying the noise sample.
+        if (applyCavesForChunk && !applySurfaceShell)
         {
             float depthBelowSurface = surfaceY - wp.y;
-            float fade = caveSurfaceFadeRange > 0f
-                ? math.saturate(depthBelowSurface / caveSurfaceFadeRange)
-                : 1f;
+            if (caveMaxDepth <= 0f || depthBelowSurface <= caveMaxDepth)
+            {
+                float fade = caveSurfaceFadeRange > 0f
+                    ? math.saturate(depthBelowSurface / caveSurfaceFadeRange)
+                    : 1f;
 
-            float cn = caveNoise.GetNoise(wp.x, wp.y * caveNoiseAmplitudeY, wp.z);
-            float effectiveThreshold = math.lerp(1f, caveNoiseThreshold, fade);
+                float cn = caveNoise.GetNoise(wp.x, wp.y * caveNoiseAmplitudeY, wp.z);
+                float effectiveThreshold = math.lerp(1f, caveNoiseThreshold, fade);
 
-            if (cn > effectiveThreshold)
-                return 0; // Air — inside a cave
+                if (cn > effectiveThreshold)
+                    return 0; // Air — inside a cave
+            }
         }
 
         // ── Layer 4 : Geological layers ────────────────────────────────────

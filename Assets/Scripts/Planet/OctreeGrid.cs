@@ -67,6 +67,16 @@ public class OctreeGrid : MonoBehaviour
     public float caveNoiseThreshold = 0.55f;
     public float caveNoiseAmplitudeY = 0.4f;
     public float caveSurfaceFadeRange = 20f;
+
+    [Tooltip("Max depth (units below surface) where caves carve. Below this, the per-voxel cave noise is skipped. " +
+             "0 = always sample (deepest caves possible). Default 256u suits typical voxel terrain.")]
+    public float caveMaxDepth = 256f;
+
+    [Tooltip("Octree division level above which caves are skipped (LODs that high don't bother sampling cave noise). " +
+             "Cave noise is the dominant per-voxel cost; capping it here is the biggest single perf win for cave worlds. " +
+             "Set to 1–3 for best perf; higher values render caves at greater distances.")]
+    [Range(1, 12)]
+    public int caveMaxDivisions = 3;
     // ─────────────────────────────────────────────────────────────────────
 
     [Header("Octree per cell")]
@@ -528,6 +538,8 @@ public class OctreeGrid : MonoBehaviour
             oct.coarseLodFaceCullMinDivisions = coarseLodFaceCullMinDivisions;
             oct.coarseLodFaceCullMargin = coarseLodFaceCullMargin;
             oct.coarseLodMinSurfaceVoxels = coarseLodMinSurfaceVoxels;
+            oct.caveMaxDepth = caveMaxDepth;
+            oct.caveMaxDivisions = caveMaxDivisions;
             oct.verticalLodBias = verticalLodBias;
             oct.geoLayerBlobs = geoLayerBlobs;
             oct.ForceRebuildTree();
@@ -685,6 +697,8 @@ public class OctreeGrid : MonoBehaviour
         octree.caveNoiseThreshold = caveNoiseThreshold;
         octree.caveNoiseAmplitudeY = caveNoiseAmplitudeY;
         octree.caveSurfaceFadeRange = caveSurfaceFadeRange;
+        octree.caveMaxDepth = caveMaxDepth;
+        octree.caveMaxDivisions = caveMaxDivisions;
         octree.verticalLodBias = verticalLodBias;
         octree.geoLayerBlobs = geoLayerBlobs;
         // ───────────────────────────────────────────────────────────────────

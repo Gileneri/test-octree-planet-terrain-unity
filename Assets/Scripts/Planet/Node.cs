@@ -337,6 +337,13 @@ public class Node
             caveNoiseThreshold = octree.caveNoiseThreshold,
             caveNoiseAmplitudeY = octree.caveNoiseAmplitudeY,
             caveSurfaceFadeRange = octree.caveSurfaceFadeRange,
+            caveMaxDepth = octree.caveMaxDepth,
+            // Per-chunk cave gate: ANDs the global toggle with the LOD
+            // distance cap and a chunk-AABB / cave-band overlap test. If
+            // false, Pass 1 will skip the per-voxel cave noise sample
+            // for every voxel in this chunk — typically tens of thousands
+            // of OpenSimplex2 calls saved per chunk on cave worlds.
+            applyCavesForChunk = ResolveApplyCavesForChunk(),
             cullEnclosedUndergroundFaces = octree.cullEnclosedUndergroundFaces,
             enclosedUndergroundFaceMargin = octree.enclosedUndergroundFaceMargin,
             useSurfaceShellOnCoarseLod = octree.useSurfaceShellOnCoarseLod,
@@ -481,6 +488,54 @@ public class Node
                 InvalidateStability();
             }
         );
+
+        return true;
+    }
+
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// Decides whether this chunk's NodeJob should evaluate caves at all.
+    /// Bundles three independent gates so the per-voxel hot path inside
+    /// SampleDensity only has to look at a single bool:
+    ///
+    ///   1. Global toggle: <c>octree.cavesEnabled</c>.
+    ///   2. LOD-distance cap: this Node must be at or below
+    ///      <c>octree.caveMaxDivisions</c>. Coarse chunks far from the
+    ///      player skip caves — they're invisible at distance and the
+    ///      noise sample is the dominant Pass 1 cost.
+    ///   3. Chunk-AABB overlap: the chunk's vertical extent must
+    ///      intersect the band where caves can carve, i.e.
+    ///      [minSurface − caveMaxDepth, maxSurface]. A chunk that is
+    ///      entirely above the highest possible surface or entirely
+    ///      below the deepest cave can return solid/air without ever
+    ///      sampling cave noise.
+    /// </summary>
+    private bool ResolveApplyCavesForChunk()
+    {
+        if (!octree.cavesEnabled) return false;
+        if (divisions > math.max(1, octree.caveMaxDivisions)) return false;
+
+        // Chunk's world Y extent (centerOffset = nodeScale/2 around NodePosition).
+        Vector3 nodePos = NodePosition();
+        float halfScale = NodeScale() * 0.5f;
+        float chunkMinY = nodePos.y - halfScale;
+        float chunkMaxY = nodePos.y + halfScale;
+
+        // Cave-active band along Y. Surface Y can range over
+        // [base − amp, base + amp]; caves carve within `caveMaxDepth` below
+        // the local surface (or unbounded if the cap is disabled).
+        float maxSurface = octree.surfaceBaseHeight + octree.surfaceNoiseAmplitude;
+        float minSurface = octree.surfaceBaseHeight - octree.surfaceNoiseAmplitude;
+        float deepestCaveY = octree.caveMaxDepth > 0f
+            ? minSurface - octree.caveMaxDepth
+            : float.NegativeInfinity;
+
+        // Skip the chunk if it sits entirely above the highest possible
+        // surface (no underground voxels at all) or entirely below the
+        // deepest cave (caves can't reach this far down).
+        if (chunkMinY > maxSurface) return false;
+        if (chunkMaxY < deepestCaveY) return false;
 
         return true;
     }

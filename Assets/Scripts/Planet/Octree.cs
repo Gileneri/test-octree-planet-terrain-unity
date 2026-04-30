@@ -36,6 +36,22 @@ public class Octree : MonoBehaviour
     [HideInInspector] public float caveNoiseThreshold = 0.55f;
     [HideInInspector] public float caveNoiseAmplitudeY = 0.4f;
     [HideInInspector] public float caveSurfaceFadeRange = 20f;
+
+    /// <summary>
+    /// Maximum depth (Y units below the local surface) where caves carve. Below
+    /// this, the per-voxel cave noise sample is skipped — at chunkResolution=32
+    /// that's tens of thousands of OpenSimplex2 calls saved per chunk. 0 = no cap.
+    /// </summary>
+    [HideInInspector] public float caveMaxDepth = 256f;
+
+    /// <summary>
+    /// Highest octree division level allowed to evaluate caves. Coarser nodes
+    /// (greater divisions) skip cave sampling entirely — caves aren't visible
+    /// at that distance and the noise dominates per-voxel cost. divisions=1
+    /// is the finest LOD. Combined with the depth cap above, this is by far
+    /// the biggest single perf knob for cave-enabled worlds.
+    /// </summary>
+    [HideInInspector] public int caveMaxDivisions = 3;
     // ─────────────────────────────────────────────────────────────────────
 
     /// <summary>

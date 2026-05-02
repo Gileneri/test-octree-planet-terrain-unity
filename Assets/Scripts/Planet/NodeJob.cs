@@ -790,11 +790,9 @@ public struct NodeJob : IJob
             return SolidId(wp); // unconditional solid
 
         // ── Layer 1 : Player modifications ────────────────────────────────
-        int3 key = new int3(
-            (int)math.floor(PosMod(wp.x, worldSizeX)),
-            (int)math.floor(wp.y),
-            (int)math.floor(PosMod(wp.z, worldSizeZ))
-        );
+        int keyX = worldSizeX > 0f ? (int)math.floor(PosMod(wp.x, worldSizeX)) : (int)math.floor(wp.x);
+        int keyZ = worldSizeZ > 0f ? (int)math.floor(PosMod(wp.z, worldSizeZ)) : (int)math.floor(wp.z);
+        int3 key = new int3(keyX, (int)math.floor(wp.y), keyZ);
 
         for (int i = 0; i < modKeys.Length; i++)
         {
@@ -807,6 +805,14 @@ public struct NodeJob : IJob
                 return SolidId(wp);
             }
         }
+
+        // Horizontal toroidal coords:
+        // Layer 1 keys use linear PosMod (matches WorldModifications.WrapKey).
+        // Surface height uses torus embedding (cx,sx,cz,sz) so noise is C¹ across wx=0≡worldSize.
+        // Caves and geological borders MUST use that same embedding — sampling GetNoise(wx,wz)
+        // with linear wx,wz creates a visible seam because noise is not periodic in plane coords.
+        ComputeToroidalNoiseCoords(wp.x, wp.z,
+            out _, out _, out float cx, out _, out float cz, out _);
 
         // ── Layer 2 : Procedural surface ──────────────────────────────────
         float maxSurface = surfaceBaseHeight + surfaceNoiseAmplitude;
@@ -845,7 +851,7 @@ public struct NodeJob : IJob
                     ? math.saturate(depthBelowSurface / caveSurfaceFadeRange)
                     : 1f;
 
-                float cn = caveNoise.GetNoise(wp.x, wp.y * caveNoiseAmplitudeY, wp.z);
+                float cn = caveNoise.GetNoise(cx, wp.y * caveNoiseAmplitudeY, cz);
                 float effectiveThreshold = math.lerp(1f, caveNoiseThreshold, fade);
 
                 if (cn > effectiveThreshold)
@@ -865,7 +871,7 @@ public struct NodeJob : IJob
 
                 // Use the pre-created border noise instance for this layer
                 var bn = borderNoises[i];
-                float borderDisplace = bn.GetNoise(wp.x, wp.z)
+                float borderDisplace = bn.GetNoise(cx, cz)
                                        * layer.borderNoiseAmplitude;
                 float layerTopDepth = layer.baseDepth + borderDisplace;
 
@@ -926,23 +932,46 @@ public struct NodeJob : IJob
 
     private float SampleSurfaceHeight(float wxWorld, float wzWorld, ref FastNoiseLite surfaceNoise)
     {
-        float wx = PosMod(wxWorld, worldSizeX);
-        float wz = PosMod(wzWorld, worldSizeZ);
-
-        float aX = wx / worldSizeX * 2f * math.PI;
-        float aZ = wz / worldSizeZ * 2f * math.PI;
-        float R = worldSizeX / (2f * math.PI);
-        float S = worldSizeZ / (2f * math.PI);
-
-        float cx = math.cos(aX) * R;
-        float sx = math.sin(aX) * R;
-        float cz = math.cos(aZ) * S;
-        float sz = math.sin(aZ) * S;
+        ComputeToroidalNoiseCoords(wxWorld, wzWorld,
+            out _, out _, out float cx, out float sx, out float cz, out float sz);
 
         float n1 = surfaceNoise.GetNoise(cx, sx, cz);
         float n2 = surfaceNoise.GetNoise(cz + 100f, sz + 100f, cx * 0.5f);
         float n3 = surfaceNoise.GetNoise(sx * 0.7f, sz * 0.7f + 200f, cz * 0.3f);
 
         return surfaceBaseHeight + (n1 * 0.6f + n2 * 0.3f + n3 * 0.1f) * surfaceNoiseAmplitude;
+    }
+
+    /// <summary>
+    /// Linear toroidal coords (PosMod) for keys / WrapKey alignment, plus torus embedding for noise.
+    /// When worldSize is disabled (&lt;= 0), passes world XZ through unchanged (open world).
+    /// </summary>
+    private void ComputeToroidalNoiseCoords(float wxWorld, float wzWorld,
+        out float wxLin, out float wzLin,
+        out float cx, out float sx, out float cz, out float sz)
+    {
+        if (worldSizeX <= 0f || worldSizeZ <= 0f)
+        {
+            wxLin = wxWorld;
+            wzLin = wzWorld;
+            cx = wxWorld;
+            sx = 0f;
+            cz = wzWorld;
+            sz = 0f;
+            return;
+        }
+
+        wxLin = PosMod(wxWorld, worldSizeX);
+        wzLin = PosMod(wzWorld, worldSizeZ);
+
+        float aX = wxLin / worldSizeX * 2f * math.PI;
+        float aZ = wzLin / worldSizeZ * 2f * math.PI;
+        float R = worldSizeX / (2f * math.PI);
+        float S = worldSizeZ / (2f * math.PI);
+
+        cx = math.cos(aX) * R;
+        sx = math.sin(aX) * R;
+        cz = math.cos(aZ) * S;
+        sz = math.sin(aZ) * S;
     }
 }

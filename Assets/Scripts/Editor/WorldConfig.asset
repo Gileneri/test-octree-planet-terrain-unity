@@ -28,5 +28,7 @@ MonoBehaviour:
   caveNoiseThreshold: 0.16
   caveNoiseAmplitudeY: 1.35
   caveSurfaceFadeRange: 29
+  caveMaxDepth: 512
+  caveMaxDivisions: 2
   geologicalLayers: {fileID: 11400000, guid: 421f85b0a4abb7e4ea7b81433010c921, type: 2}
   renderRadius: 7

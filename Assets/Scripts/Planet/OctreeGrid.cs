@@ -5,7 +5,23 @@ using Unity.Collections;
 using Unity.Jobs;
 
 /// <summary>
-/// Manages a grid of Octrees centred on the player with seamless toroidal wrap.
+/// Manages a grid of Octrees around the player with seamless toroidal wrap via the FUNDAMENTAL DOMAIN
+/// streaming scheme (only one Octree instance per canonical chunk, repositioned across seams instead
+/// of duplicated).
+///
+/// STREAMING — fundamental domain + per-chunk origin shift
+/// ───────────────────────────────────────────────────────
+/// activeCells is keyed by canonical (i % N, j % N). Each Octree carries its currentEuclideanCell —
+/// the *physical* representative whose <c>cellOrigin = currentEuclideanCell * cellSize</c> sits closest
+/// to the player. When the player crosses a toroidal seam, <see cref="RebaseDriftedCells"/> picks the
+/// nearest representative for every chunk and calls <see cref="Octree.RebaseCellOrigin"/>, which walks
+/// the tree and reapplies <c>transform.position</c> on each Node (no rebuild, no remesh).
+///
+/// Density in NodeJob is already periodic via PosMod(worldSize). Because every shift is an exact
+/// multiple of worldSize, <c>PosMod(oldPos) == PosMod(newPos)</c> — in-flight jobs stay correct.
+///
+/// IMPORTANT: pick worldSize so that <c>renderRadius * 2 * cellSize &lt; worldSize / 2</c>. Otherwise
+/// the render disk overlaps itself across the seam and the player will see the same chunks twice.
 ///
 /// LOD DISTANCE — lodDistanceCurve
 /// ─────────────────────────────────
@@ -37,6 +53,7 @@ using Unity.Jobs;
 public class OctreeGrid : MonoBehaviour
 {
     [Header("World")]
+    [Tooltip("Toroidal periods in world units. Prefer multiples of cellSize (see console at Start) for chunk-aligned seams. Optional: add ToroidalBoundaryWrap on the priority object.")]
     public float worldSizeX = 50000f;
     public float worldSizeZ = 50000f;
 
@@ -190,6 +207,32 @@ public class OctreeGrid : MonoBehaviour
     [Tooltip("How strongly the load centre shifts ahead.")]
     public float predictionStrength = 1f;
 
+    [Header("Seam transition (aggressive)")]
+    [Tooltip("World-space band width around toroidal seams where aggressive pre-detailing activates.")]
+    [Min(0f)] public float seamTransitionBandWorld = 512f;
+
+    [Tooltip("Max temporary extra cells added to coverage radius while inside seam transition band.")]
+    [Range(0, 4)] public int seamPrefetchExtraCells = 2;
+
+    [Tooltip("Maximum LOD radius multiplier contribution near seam. 1.0 means up to +100% radius.")]
+    [Min(0f)] public float seamLodBoostMax = 1.0f;
+
+    [Tooltip("Falloff exponent for seam LOD boost (1=linear, >1 steeper near seam edge).")]
+    [Min(0.1f)] public float seamBoostFalloff = 1.75f;
+
+    [Tooltip("Extra cells that can be created per frame while near seam (helps opposite-side strips appear before crossing).")]
+    [Range(0, 32)] public int seamPreloadBurstCreates = 8;
+
+    [Header("Seam stability (optional)")]
+    [Tooltip("Keeps chunks just outside renderRadius alive for a short grace window near seams to reduce add/remove churn during seam oscillation.")]
+    public bool useSeamChunkGrace = false;
+
+    [Tooltip("Extra Chebyshev cells beyond renderRadius that qualify for grace retention.")]
+    [Min(0)] public int seamGraceSlackCells = 1;
+
+    [Tooltip("Seconds to keep an out-of-range chunk alive while in grace zone.")]
+    [Min(0f)] public float seamGraceSeconds = 0.5f;
+
     [Header("References")]
     public Transform priority;
     public Camera playerCamera;   // used for frustum culling — assign the player camera
@@ -200,9 +243,11 @@ public class OctreeGrid : MonoBehaviour
     private readonly Dictionary<Vector2Int, Octree> activeCells
         = new Dictionary<Vector2Int, Octree>();
     private readonly Queue<Vector2Int> pendingCells = new Queue<Vector2Int>();
+    private readonly HashSet<Vector2Int> _pendingCellsDedupe = new HashSet<Vector2Int>();
     private readonly List<PrioritizedJob> frameJobs = new List<PrioritizedJob>();
     private readonly List<JobCompleter> interactivePendingJobs = new List<JobCompleter>();
     private readonly List<ScheduledJob> inFlightJobs = new List<ScheduledJob>();
+    private readonly Dictionary<Vector2Int, float> seamGraceFirstOutOfRangeAt = new Dictionary<Vector2Int, float>();
 
     private float cellSize;
     private Vector2Int lastPlayerCell = new Vector2Int(int.MaxValue, int.MaxValue);
@@ -224,6 +269,20 @@ public class OctreeGrid : MonoBehaviour
     private const float SpikeCutoffMultiplier = 1.75f;
     private const float SpikeBudgetDropFactor = 0.6f;
     private float _undergroundCullBelowY;
+    private float _seamProximity01;
+    private int _seamExtraCells;
+    private float _lastSeamLogTime = float.NegativeInfinity;
+    private readonly List<Vector2Int> _seamPrefetchCentres = new List<Vector2Int>(4);
+
+    /// <summary>
+    /// When the priority transform is moved by a toroidal wrap (delta = newPos - oldPos),
+    /// call this with the same delta so velocity tracking and predictive loading do not see
+    /// a spurious world-spanning displacement. Usually invoked from <see cref="ToroidalBoundaryWrap"/>.
+    /// </summary>
+    public void ApplyToroidalTrackingCorrection(Vector3 positionDelta)
+    {
+        prevPlayerPos += positionDelta;
+    }
 
     // -----------------------------------------------------------------------
 
@@ -264,6 +323,32 @@ public class OctreeGrid : MonoBehaviour
                   $"seed={noiseSeed}  noiseTypeId={noiseTypeId}  " +
                   $"minSubY={minSubsurfaceHeight}");
 
+        // Fundamental-domain streaming dedups canonical chunks: when the render disk (2*renderRadius+1
+        // cells) is wider than the world period in cells, multiple euclidean candidates map to the
+        // same canonical key — only ONE is created, and the missing slots show up as holes/visible
+        // world borders. Recommended margin is 2x for comfortable headroom.
+        int diameterCells = renderRadius * 2 + 1;
+        float minWorldHard = diameterCells * cellSize;
+        float minWorldSoft = diameterCells * cellSize * 2f;
+        if (worldSizeX > 0f && worldSizeX < minWorldHard)
+            UnityEngine.Debug.LogError(
+                $"[OctreeGrid] worldSizeX={worldSizeX} < required {minWorldHard:F0} " +
+                $"({diameterCells} cells × {cellSize}). Toroidal wrap WILL show holes/borders. " +
+                $"Pick worldSizeX >= {minWorldSoft:F0} for a comfortable seamless wrap.");
+        else if (worldSizeX > 0f && worldSizeX < minWorldSoft)
+            UnityEngine.Debug.LogWarning(
+                $"[OctreeGrid] worldSizeX={worldSizeX} barely fits the render disk " +
+                $"(min={minWorldHard:F0}). Recommended >= {minWorldSoft:F0}.");
+        if (worldSizeZ > 0f && worldSizeZ < minWorldHard)
+            UnityEngine.Debug.LogError(
+                $"[OctreeGrid] worldSizeZ={worldSizeZ} < required {minWorldHard:F0} " +
+                $"({diameterCells} cells × {cellSize}). Toroidal wrap WILL show holes/borders. " +
+                $"Pick worldSizeZ >= {minWorldSoft:F0} for a comfortable seamless wrap.");
+        else if (worldSizeZ > 0f && worldSizeZ < minWorldSoft)
+            UnityEngine.Debug.LogWarning(
+                $"[OctreeGrid] worldSizeZ={worldSizeZ} barely fits the render disk " +
+                $"(min={minWorldHard:F0}). Recommended >= {minWorldSoft:F0}.");
+
         prevPlayerPos = priority.position;
         _dynamicJobsPerFrame = Mathf.Max(1, maxJobsPerFrame);
         RecomputeUndergroundCullBelowY();
@@ -277,23 +362,43 @@ public class OctreeGrid : MonoBehaviour
         Vector3 rawVelocity = (priority.position - prevPlayerPos) / Time.deltaTime;
         playerVelocity = Vector3.Lerp(playerVelocity, rawVelocity, VelocitySmooth);
         prevPlayerPos = priority.position;
+        UpdateSeamTransitionContext(priority.position);
 
         Vector2Int playerCell = WorldToCell(priority.position);
         Vector2Int loadCentre = ComputeLoadCentre(playerCell);
 
-        if (loadCentre != lastLoadCentre)
+        bool playerCellChanged = playerCell != lastPlayerCell;
+        bool loadCentreChanged = loadCentre != lastLoadCentre;
+
+        bool terrainRebased = false;
+        // Rebase BEFORE Enqueue/Destroy so chunks already adopted the correct euclidean
+        // representative when we measure distance and dedup canonical keys.
+        if (playerCellChanged || loadCentreChanged)
+            terrainRebased = RebaseDriftedCells(playerCell);
+
+        if (loadCentreChanged)
         {
             lastLoadCentre = loadCentre;
             EnqueueDesiredCells(loadCentre);
         }
 
-        if (playerCell != lastPlayerCell)
+        // Preload opposite-side strip BEFORE crossing: run every frame while near a seam.
+        // Bucket-gating caused strips to appear only after cell/bucket changes (too late visually).
+        if (_seamProximity01 > 0f && seamTransitionBandWorld > 0f)
+        {
+            CollectSeamPrefetchCentres(priority.position, playerCell, _seamPrefetchCentres);
+            for (int i = 0; i < _seamPrefetchCentres.Count; i++)
+                EnqueueDesiredCells(_seamPrefetchCentres[i]);
+        }
+
+        if (playerCellChanged)
         {
             lastPlayerCell = playerCell;
             DestroyOutOfRangeCells(playerCell);
         }
 
-        ProcessPendingCells(newCellsPerFrame);
+        int seamBurst = Mathf.RoundToInt(_seamProximity01 * seamPreloadBurstCreates);
+        ProcessPendingCells(newCellsPerFrame + seamBurst);
 
         // Extract frustum planes once per frame for all octrees to share.
         // If no camera is assigned, frustum culling is skipped (planes = null).
@@ -304,7 +409,27 @@ public class OctreeGrid : MonoBehaviour
         RecomputeUndergroundCullBelowY();
 
         foreach (var octree in activeCells.Values)
+        {
+            octree.maxNodeCreationsPerFrame = maxNodeCreationsPerFrame;
+            octree.seamTransitionBandWorld = seamTransitionBandWorld;
+            octree.seamProximity01 = _seamProximity01;
+            octree.seamLodBoostMax = seamLodBoostMax;
+            octree.seamBoostFalloff = seamBoostFalloff;
             octree.Tick(frameJobs, priority.position, frustumPlanes, _undergroundCullBelowY);
+        }
+
+        // ToroidalBoundaryWrap runs earlier (DefaultExecutionOrder -50) and calls SyncTransforms after
+        // moving the player. RebaseDriftedCells then shifts every chunk MeshCollider transform by ±worldSize.
+        // Without a second sync, PhysX can query stale poses for up to a physics step — worst case the
+        // CharacterController sweeps against empty space for one frame at the seam.
+        if ((worldSizeX > 0f || worldSizeZ > 0f) && (terrainRebased || playerCellChanged))
+            Physics.SyncTransforms();
+
+        if (_seamProximity01 > 0f && Time.time - _lastSeamLogTime > 0.5f)
+        {
+            _lastSeamLogTime = Time.time;
+            UnityEngine.Debug.Log($"[OctreeGrid][Seam] proximity={_seamProximity01:F2} extraCells={_seamExtraCells} active={activeCells.Count} pending={pendingCells.Count}");
+        }
     }
 
     private void LateUpdate()
@@ -364,6 +489,7 @@ public class OctreeGrid : MonoBehaviour
         foreach (var octree in activeCells.Values)
             octree.Shutdown();
         activeCells.Clear();
+        seamGraceFirstOutOfRangeAt.Clear();
         pendingCells.Clear();
 
         // Drop pooled chunk GameObjects — keeping them across scene loads
@@ -377,6 +503,7 @@ public class OctreeGrid : MonoBehaviour
         GUILayout.Label($"World: {worldSizeX} × {worldSizeZ} units  (toroidal)");
         GUILayout.Label($"Active cells: {activeCells.Count}  Pending: {pendingCells.Count}  Jobs: collect={frameJobs.Count} interactive={interactivePendingJobs.Count} inFlight={inFlightJobs.Count}");
         GUILayout.Label($"Meshing budget: current={_dynamicJobsPerFrame} targetMs={targetMeshingBudgetMs:F1} avgJobMs={_emaJobCostMs:F2}");
+        GUILayout.Label($"Seam mode: proximity={_seamProximity01:F2} extraCells={_seamExtraCells} lodBoostMax={seamLodBoostMax:F2}");
         GUILayout.Label($"Underground node cull: {(enableUndergroundNodeCull ? $"ON belowY={_undergroundCullBelowY:F1}" : "OFF")}");
         GUILayout.Label($"Enclosed underground faces: {(cullEnclosedUndergroundFaces ? $"ON margin={enclosedUndergroundFaceMargin:F1}" : "OFF")}");
         GUILayout.Label($"Surface shell coarse: {(useSurfaceShellOnCoarseLod ? $"ON minDiv={surfaceShellMinDivisions}" : "OFF")}");
@@ -497,7 +624,9 @@ public class OctreeGrid : MonoBehaviour
         Gizmos.color = new Color(0f, 1f, 0.5f, 0.15f);
         foreach (var kv in activeCells)
         {
-            Vector3 centre = CellToWorld(kv.Key) + new Vector3(cellSize, 0, cellSize) * 0.5f;
+            // Draw at the physical representative — the canonical key may sit a full world away.
+            Vector3 centre = CellToWorld(kv.Value.currentEuclideanCell)
+                             + new Vector3(cellSize, 0, cellSize) * 0.5f;
             Gizmos.DrawWireCube(centre, new Vector3(cellSize, cellSize * 0.1f, cellSize));
         }
     }
@@ -538,6 +667,10 @@ public class OctreeGrid : MonoBehaviour
             oct.coarseLodFaceCullMinDivisions = coarseLodFaceCullMinDivisions;
             oct.coarseLodFaceCullMargin = coarseLodFaceCullMargin;
             oct.coarseLodMinSurfaceVoxels = coarseLodMinSurfaceVoxels;
+            oct.seamTransitionBandWorld = seamTransitionBandWorld;
+            oct.seamLodBoostMax = seamLodBoostMax;
+            oct.seamBoostFalloff = seamBoostFalloff;
+            oct.seamProximity01 = _seamProximity01;
             oct.caveMaxDepth = caveMaxDepth;
             oct.caveMaxDivisions = caveMaxDivisions;
             oct.verticalLodBias = verticalLodBias;
@@ -618,6 +751,74 @@ public class OctreeGrid : MonoBehaviour
         );
     }
 
+    private static float PosMod(float x, float m)
+    {
+        float r = x % m;
+        return r < 0f ? r + m : r;
+    }
+
+    private static float AxisSeamDistance(float axisWorld, float worldSize)
+    {
+        if (worldSize <= 0f) return float.PositiveInfinity;
+        float w = PosMod(axisWorld, worldSize);
+        return Mathf.Min(w, worldSize - w);
+    }
+
+    private void UpdateSeamTransitionContext(Vector3 playerPos)
+    {
+        if (seamTransitionBandWorld <= 0f || (worldSizeX <= 0f && worldSizeZ <= 0f))
+        {
+            _seamProximity01 = 0f;
+            _seamExtraCells = 0;
+            return;
+        }
+
+        float band = seamTransitionBandWorld;
+        float dx = AxisSeamDistance(playerPos.x, worldSizeX);
+        float dz = AxisSeamDistance(playerPos.z, worldSizeZ);
+        float pX = worldSizeX > 0f ? Mathf.Clamp01(1f - dx / band) : 0f;
+        float pZ = worldSizeZ > 0f ? Mathf.Clamp01(1f - dz / band) : 0f;
+        _seamProximity01 = Mathf.Max(pX, pZ);
+        _seamExtraCells = Mathf.RoundToInt(Mathf.Clamp01(_seamProximity01) * seamPrefetchExtraCells);
+    }
+
+    private void CollectSeamPrefetchCentres(Vector3 playerPos, Vector2Int playerCell, List<Vector2Int> into)
+    {
+        into.Clear();
+        if (_seamProximity01 <= 0f || seamTransitionBandWorld <= 0f) return;
+
+        int shiftX = 0;
+        int shiftZ = 0;
+
+        if (worldSizeX > 0f && CellsPerAxisX > 0)
+        {
+            float w = PosMod(playerPos.x, worldSizeX);
+            if (w < seamTransitionBandWorld) shiftX = CellsPerAxisX;
+            else if (worldSizeX - w < seamTransitionBandWorld) shiftX = -CellsPerAxisX;
+        }
+        if (worldSizeZ > 0f && CellsPerAxisZ > 0)
+        {
+            float w = PosMod(playerPos.z, worldSizeZ);
+            if (w < seamTransitionBandWorld) shiftZ = CellsPerAxisZ;
+            else if (worldSizeZ - w < seamTransitionBandWorld) shiftZ = -CellsPerAxisZ;
+        }
+
+        if (shiftX == 0 && shiftZ == 0) return;
+
+        // Anchor prefetch disks on the player's cell so wrapped representatives stay aligned with
+        // streaming distance checks (loadCentre can lag behind when prediction is off).
+        void TryAdd(Vector2Int c)
+        {
+            for (int i = 0; i < into.Count; i++)
+                if (into[i] == c) return;
+            into.Add(c);
+        }
+
+        if (shiftX != 0) TryAdd(new Vector2Int(playerCell.x + shiftX, playerCell.y));
+        if (shiftZ != 0) TryAdd(new Vector2Int(playerCell.x, playerCell.y + shiftZ));
+        if (shiftX != 0 && shiftZ != 0) TryAdd(new Vector2Int(playerCell.x + shiftX, playerCell.y + shiftZ));
+    }
+
     // -----------------------------------------------------------------------
     //  Grid management
     // -----------------------------------------------------------------------
@@ -625,39 +826,121 @@ public class OctreeGrid : MonoBehaviour
     private void EnqueueDesiredCells(Vector2Int centre)
     {
         Vector2Int playerCell = WorldToCell(priority.position);
-        var missing = new List<(Vector2Int cell, float sqrDist)>();
+        // While in the seam band, ensure at least seamPrefetchExtraCells is applied so toroidal
+        // neighbours (e.g. ideal rep one period away) enter the disk before proximity ramps to 1.
+        int seamCellMargin = 0;
+        if (_seamProximity01 > 0f && seamTransitionBandWorld > 0f && seamPrefetchExtraCells > 0)
+            seamCellMargin = Mathf.Max(_seamExtraCells, seamPrefetchExtraCells);
+        else
+            seamCellMargin = _seamExtraCells;
+        int effectiveRadius = renderRadius + seamCellMargin;
 
-        for (int dx = -renderRadius; dx <= renderRadius; dx++)
-            for (int dz = -renderRadius; dz <= renderRadius; dz++)
+        // Dedup by canonical key — when a small toroidal world wraps inside the render disk
+        // multiple euclidean cells can map to the same canonical chunk. Always enqueue the
+        // representative nearest to the player (not the toroidal alias seen from `centre`), so
+        // distance sorting matches DestroyOutOfRangeCells and opposite-side strips spawn in range.
+        var missingByCanonical = new Dictionary<Vector2Int, (Vector2Int ideal, float sqrDist)>();
+
+        for (int dx = -effectiveRadius; dx <= effectiveRadius; dx++)
+            for (int dz = -effectiveRadius; dz <= effectiveRadius; dz++)
             {
-                var cell = new Vector2Int(centre.x + dx, centre.y + dz);
-                if (!activeCells.ContainsKey(cell))
-                {
-                    int pdx = cell.x - playerCell.x;
-                    int pdz = cell.y - playerCell.y;
-                    missing.Add((cell, pdx * pdx + pdz * pdz));
-                }
+                var eucCell = new Vector2Int(centre.x + dx, centre.y + dz);
+                var canonical = CanonicalCell(eucCell);
+                if (activeCells.ContainsKey(canonical)) continue;
+
+                var ideal = NearestEuclideanCell(canonical, playerCell);
+                int pdx = ideal.x - playerCell.x;
+                int pdz = ideal.y - playerCell.y;
+                float sqrDist = pdx * pdx + pdz * pdz;
+
+                if (!missingByCanonical.TryGetValue(canonical, out var existing) || sqrDist < existing.sqrDist)
+                    missingByCanonical[canonical] = (ideal, sqrDist);
             }
 
-        missing.Sort((a, b) => a.sqrDist.CompareTo(b.sqrDist));
-        foreach (var (cell, _) in missing)
-            pendingCells.Enqueue(cell);
+        var sorted = new List<(Vector2Int ideal, float sqrDist)>(missingByCanonical.Values);
+        sorted.Sort((a, b) => a.sqrDist.CompareTo(b.sqrDist));
+        foreach (var entry in sorted)
+        {
+            if (_pendingCellsDedupe.Contains(entry.ideal)) continue;
+            pendingCells.Enqueue(entry.ideal);
+            _pendingCellsDedupe.Add(entry.ideal);
+        }
     }
 
     private void DestroyOutOfRangeCells(Vector2Int playerCell)
     {
         var toRemove = new List<Vector2Int>();
+        bool canUseGrace = useSeamChunkGrace && (worldSizeX > 0f || worldSizeZ > 0f) && seamGraceSeconds > 0f;
+        int seamCellMargin = 0;
+        if (_seamProximity01 > 0f && seamTransitionBandWorld > 0f && seamPrefetchExtraCells > 0)
+            seamCellMargin = Mathf.Max(_seamExtraCells, seamPrefetchExtraCells);
+        else
+            seamCellMargin = _seamExtraCells;
+        int effectiveRadius = renderRadius + seamCellMargin;
+        int graceMaxChebyshev = effectiveRadius + Mathf.Max(0, seamGraceSlackCells);
+        float now = Time.time;
+
         foreach (var kv in activeCells)
         {
-            int dx = Mathf.Abs(kv.Key.x - playerCell.x);
-            int dz = Mathf.Abs(kv.Key.y - playerCell.y);
-            if (dx > renderRadius || dz > renderRadius)
+            // Measure range using the representative nearest the player for this canonical chunk.
+            // Using currentEuclideanCell alone can destroy toroidal neighbours that are still
+            // visible (wrong-period alias) or keep the wrong instance — ideal matches EnqueueDesiredCells.
+            var canonical = kv.Key;
+            var ideal = NearestEuclideanCell(canonical, playerCell);
+            int dx = Mathf.Abs(ideal.x - playerCell.x);
+            int dz = Mathf.Abs(ideal.y - playerCell.y);
+            int chebyshev = Mathf.Max(dx, dz);
+
+            if (chebyshev <= effectiveRadius)
             {
-                kv.Value.Shutdown();
-                toRemove.Add(kv.Key);
+                seamGraceFirstOutOfRangeAt.Remove(kv.Key);
+                continue;
+            }
+
+            if (canUseGrace && chebyshev <= graceMaxChebyshev)
+            {
+                if (!seamGraceFirstOutOfRangeAt.TryGetValue(kv.Key, out float firstOutAt))
+                {
+                    seamGraceFirstOutOfRangeAt[kv.Key] = now;
+                    continue;
+                }
+
+                if (now - firstOutAt < seamGraceSeconds)
+                    continue;
+            }
+
+            kv.Value.Shutdown();
+            toRemove.Add(kv.Key);
+            seamGraceFirstOutOfRangeAt.Remove(kv.Key);
+        }
+
+        foreach (var k in toRemove)
+            activeCells.Remove(k);
+    }
+    /// <summary>
+    /// For every active chunk, picks the euclidean representative closest to the player
+    /// (canonical + k * cellsPerAxis on each toroidal axis) and shifts the Octree's cellOrigin
+    /// to match. After a player wrap (e.g. via <see cref="ToroidalBoundaryWrap"/>) this puts
+    /// the chunks behind the player on the near side of the seam without any rebuild.
+    /// </summary>
+    /// <returns>True if at least one chunk shifted its physical origin this frame.</returns>
+    private bool RebaseDriftedCells(Vector2Int playerEucCell)
+    {
+        if (CellsPerAxisX <= 0 && CellsPerAxisZ <= 0) return false;
+
+        bool any = false;
+        foreach (var kv in activeCells)
+        {
+            var canonical = kv.Key;
+            var oct = kv.Value;
+            var nearest = NearestEuclideanCell(canonical, playerEucCell);
+            if (nearest != oct.currentEuclideanCell)
+            {
+                oct.RebaseCellOrigin(CellToWorld(nearest), nearest);
+                any = true;
             }
         }
-        foreach (var k in toRemove) activeCells.Remove(k);
+        return any;
     }
 
     private void ProcessPendingCells(int maxThisFrame)
@@ -665,10 +948,12 @@ public class OctreeGrid : MonoBehaviour
         int created = 0;
         while (pendingCells.Count > 0 && created < maxThisFrame)
         {
-            Vector2Int cell = pendingCells.Dequeue();
-            if (!activeCells.ContainsKey(cell))
+            Vector2Int eucCell = pendingCells.Dequeue();
+            _pendingCellsDedupe.Remove(eucCell);
+            Vector2Int canonical = CanonicalCell(eucCell);
+            if (!activeCells.ContainsKey(canonical))
             {
-                activeCells[cell] = CreateOctree(cell);
+                activeCells[canonical] = CreateOctree(eucCell);
                 created++;
             }
         }
@@ -678,9 +963,11 @@ public class OctreeGrid : MonoBehaviour
     //  Octree factory
     // -----------------------------------------------------------------------
 
-    private Octree CreateOctree(Vector2Int cell)
+    private Octree CreateOctree(Vector2Int eucCell)
     {
-        var go = new GameObject($"Cell_{cell.x}_{cell.y}");
+        // eucCell is the *physical* (euclidean) representative used for cellOrigin; its
+        // canonical wrap is the dictionary key in activeCells (computed by the caller).
+        var go = new GameObject($"Cell_{eucCell.x}_{eucCell.y}");
         go.transform.parent = transform;
 
         var octree = go.AddComponent<Octree>();
@@ -707,7 +994,8 @@ public class OctreeGrid : MonoBehaviour
         octree.maxNodeCreationsPerFrame = maxNodeCreationsPerFrame;
         octree.priority = priority;
         octree.chunkPrefab = chunkPrefab;
-        octree.cellOrigin = CellToWorld(cell);
+        octree.cellOrigin = CellToWorld(eucCell);
+        octree.currentEuclideanCell = eucCell;
         octree.maxColliderDivisions = _maxColliderDivisions;
         octree.undergroundCullBelowY = _undergroundCullBelowY;
         octree.cullEnclosedUndergroundFaces = cullEnclosedUndergroundFaces;
@@ -718,6 +1006,10 @@ public class OctreeGrid : MonoBehaviour
         octree.coarseLodFaceCullMinDivisions = coarseLodFaceCullMinDivisions;
         octree.coarseLodFaceCullMargin = coarseLodFaceCullMargin;
         octree.coarseLodMinSurfaceVoxels = coarseLodMinSurfaceVoxels;
+        octree.seamTransitionBandWorld = seamTransitionBandWorld;
+        octree.seamProximity01 = _seamProximity01;
+        octree.seamLodBoostMax = seamLodBoostMax;
+        octree.seamBoostFalloff = seamBoostFalloff;
         octree.lodRadii = lodRadii;   // share the baked array — read-only at runtime
 
         octree.Initialize();
@@ -747,15 +1039,80 @@ public class OctreeGrid : MonoBehaviour
     public Vector3 CellToWorld(Vector2Int cell) =>
         new Vector3(cell.x * cellSize, 0f, cell.y * cellSize);
 
+    /// <summary>
+    /// Number of chunk cells per toroidal period on X. Zero when worldSizeX &lt;= 0
+    /// (open world: canonical == euclidean and no rebase happens).
+    /// </summary>
+    private int CellsPerAxisX => worldSizeX > 0f && cellSize > 0f
+        ? Mathf.Max(1, Mathf.RoundToInt(worldSizeX / cellSize))
+        : 0;
+
+    private int CellsPerAxisZ => worldSizeZ > 0f && cellSize > 0f
+        ? Mathf.Max(1, Mathf.RoundToInt(worldSizeZ / cellSize))
+        : 0;
+
+    /// <summary>
+    /// Wraps a euclidean cell index into [0, CellsPerAxis) on each toroidal axis.
+    /// Acts as identity on axes where worldSize == 0.
+    /// </summary>
+    public Vector2Int CanonicalCell(Vector2Int eucCell)
+    {
+        int nx = CellsPerAxisX;
+        int nz = CellsPerAxisZ;
+        int cx = nx > 0 ? ((eucCell.x % nx) + nx) % nx : eucCell.x;
+        int cz = nz > 0 ? ((eucCell.y % nz) + nz) % nz : eucCell.y;
+        return new Vector2Int(cx, cz);
+    }
+
+    /// <summary>
+    /// Returns the euclidean representative (canonical + k*CellsPerAxis on each axis) closest
+    /// to <paramref name="playerEucCell"/>. Used to keep each chunk's physical origin next to
+    /// the player after a toroidal seam crossing.
+    /// </summary>
+    public Vector2Int NearestEuclideanCell(Vector2Int canonical, Vector2Int playerEucCell)
+    {
+        int nx = CellsPerAxisX;
+        int nz = CellsPerAxisZ;
+        int rx = canonical.x;
+        int rz = canonical.y;
+
+        if (nx > 0)
+        {
+            int delta = playerEucCell.x - canonical.x;
+            int k = Mathf.RoundToInt((float)delta / nx);
+            rx = canonical.x + k * nx;
+        }
+        if (nz > 0)
+        {
+            int delta = playerEucCell.y - canonical.y;
+            int k = Mathf.RoundToInt((float)delta / nz);
+            rz = canonical.y + k * nz;
+        }
+        return new Vector2Int(rx, rz);
+    }
+
     // -----------------------------------------------------------------------
     //  Block interaction support
     // -----------------------------------------------------------------------
 
     public Node FindLeafAt(Vector3 worldPos)
     {
-        Vector2Int cell = WorldToCell(worldPos);
-        return activeCells.TryGetValue(cell, out Octree octree)
-            ? octree.FindLeafAt(worldPos)
-            : null;
+        Vector2Int eucCell = WorldToCell(worldPos);
+        Vector2Int canonical = CanonicalCell(eucCell);
+        if (!activeCells.TryGetValue(canonical, out Octree octree)) return null;
+
+        // The chunk's tree is positioned at currentEuclideanCell, which may differ from the
+        // worldPos's natural eucCell by a multiple of cellsPerAxis. Translate the query into
+        // the chunk's frame so AABB containment in Octree.FindLeafAt still matches.
+        Vector2Int chunkEuc = octree.currentEuclideanCell;
+        if (chunkEuc != eucCell)
+        {
+            Vector3 delta = new Vector3(
+                (chunkEuc.x - eucCell.x) * cellSize,
+                0f,
+                (chunkEuc.y - eucCell.y) * cellSize);
+            worldPos += delta;
+        }
+        return octree.FindLeafAt(worldPos);
     }
 }

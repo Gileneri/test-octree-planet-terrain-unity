@@ -14,6 +14,13 @@ public class Octree : MonoBehaviour
     [HideInInspector] public GameObject chunkPrefab;
     [HideInInspector] public Vector3 cellOrigin;
 
+    /// <summary>
+    /// Euclidean cell index used as the physical origin for this chunk (cellOrigin).
+    /// May differ from the canonical key in <see cref="OctreeGrid"/> by multiples of
+    /// cells-per-axis when the player crosses a toroidal seam.
+    /// </summary>
+    [HideInInspector] public Vector2Int currentEuclideanCell;
+
     // ── WorldConfig-driven fields (added) ────────────────────────────────
     /// <summary>FastNoiseLite seed forwarded to every NodeJob.</summary>
     [HideInInspector] public int noiseSeed = 2376;
@@ -115,6 +122,11 @@ public class Octree : MonoBehaviour
     [HideInInspector] public int coarseLodFaceCullMinDivisions = 4;
     [HideInInspector] public float coarseLodFaceCullMargin = 1.5f;
     [HideInInspector] public int coarseLodMinSurfaceVoxels = 2;
+
+    [HideInInspector] public float seamTransitionBandWorld = 512f;
+    [HideInInspector] public float seamProximity01 = 0f;
+    [HideInInspector] public float seamLodBoostMax = 1f;
+    [HideInInspector] public float seamBoostFalloff = 1.75f;
     // ─────────────────────────────────────────────────────────────────────
 
     [HideInInspector] public Node root;
@@ -159,6 +171,39 @@ public class Octree : MonoBehaviour
         root = null;
         initialised = false;
         Destroy(gameObject);
+    }
+
+    /// <summary>
+    /// Shifts <see cref="cellOrigin"/> to a different toroidal representative without rebuilding the tree.
+    /// Density sampling stays valid because NodeJob uses PosMod(worldSize).
+    /// </summary>
+    public void RebaseCellOrigin(Vector3 newCellOrigin, Vector2Int newEuclideanCell)
+    {
+        if (cellOrigin == newCellOrigin && currentEuclideanCell == newEuclideanCell)
+            return;
+
+        cellOrigin = newCellOrigin;
+        currentEuclideanCell = newEuclideanCell;
+
+        if (root != null)
+        {
+            int nodeResolution = (int)Mathf.Pow(2f, divisions - 1);
+            float nodeScale = chunkResolution * nodeResolution;
+            Vector3 rootOffset = cellOrigin + new Vector3(nodeScale, nodeScale, nodeScale) * 0.5f;
+            rootOffset.y = surfaceBaseHeight;
+            root.offset = rootOffset;
+
+            ReapplyTransformsRecursive(root);
+        }
+    }
+
+    private static void ReapplyTransformsRecursive(Node n)
+    {
+        if (n == null) return;
+        n.OnCellOriginShifted();
+        if (n.children != null)
+            for (int i = 0; i < n.children.Length; i++)
+                ReapplyTransformsRecursive(n.children[i]);
     }
 
     /// <summary>
@@ -279,8 +324,41 @@ public class Octree : MonoBehaviour
             ? lodRadii[level]
             : node.NodeScale() * 2f;   // fallback
 
+        radius *= ComputeSeamLodRadiusMultiplier(node);
+
         // Use bias-weighted distance so vertical nodes collapse sooner
         return AabbSqrDistLod(node, playerPos) < radius * radius;
+    }
+
+    private static float PosMod(float x, float m)
+    {
+        float r = x % m;
+        return r < 0f ? r + m : r;
+    }
+
+    private static float AxisSeamDistance(float axisWorld, float worldSize)
+    {
+        if (worldSize <= 0f) return float.PositiveInfinity;
+        float w = PosMod(axisWorld, worldSize);
+        return Mathf.Min(w, worldSize - w);
+    }
+
+    private float ComputeSeamLodRadiusMultiplier(Node node)
+    {
+        if (seamProximity01 <= 0f || seamLodBoostMax <= 0f || seamTransitionBandWorld <= 0f)
+            return 1f;
+
+        Vector3 c = node.NodePosition();
+        float band = seamTransitionBandWorld;
+        float dx = AxisSeamDistance(c.x, worldSizeX);
+        float dz = AxisSeamDistance(c.z, worldSizeZ);
+        float nearX = worldSizeX > 0f ? Mathf.Clamp01(1f - dx / band) : 0f;
+        float nearZ = worldSizeZ > 0f ? Mathf.Clamp01(1f - dz / band) : 0f;
+        float nodeNear = Mathf.Max(nearX, nearZ);
+        if (nodeNear <= 0f) return 1f;
+
+        float shaped = Mathf.Pow(nodeNear, Mathf.Max(0.1f, seamBoostFalloff));
+        return 1f + seamProximity01 * shaped * seamLodBoostMax;
     }
 
     // -----------------------------------------------------------------------

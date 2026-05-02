@@ -590,6 +590,19 @@ public class Node
         return (offset * ns) - (Vector3.one * (ns * 0.5f)) + parent.NodePosition();
     }
 
+    /// <summary>
+    /// Called after the owning octree shifts <see cref="Octree.cellOrigin"/> across a toroidal period.
+    /// Refreshes world pose so MeshCollider and rendering stay aligned without rebuilding meshes.
+    /// </summary>
+    public void OnCellOriginShifted()
+    {
+        if (gameObject == null) return;
+        var pos = NodePosition();
+        gameObject.transform.position = pos;
+        gameObject.name = pos.ToString();
+        InvalidateStability();
+    }
+
     // -----------------------------------------------------------------------
     //  Hierarchical visibility
     //

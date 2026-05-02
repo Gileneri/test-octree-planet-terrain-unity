@@ -223,6 +223,9 @@ public class OctreeGrid : MonoBehaviour
     [Tooltip("Extra cells that can be created per frame while near seam (helps opposite-side strips appear before crossing).")]
     [Range(0, 32)] public int seamPreloadBurstCreates = 8;
 
+    [Tooltip("Log seam proximity / streaming counts while near a toroidal seam (rate-limited). Leave off to avoid console spam.")]
+    public bool logSeamTransition = false;
+
     [Header("Seam stability (optional)")]
     [Tooltip("Keeps chunks just outside renderRadius alive for a short grace window near seams to reduce add/remove churn during seam oscillation.")]
     public bool useSeamChunkGrace = false;
@@ -237,6 +240,9 @@ public class OctreeGrid : MonoBehaviour
     public Transform priority;
     public Camera playerCamera;   // used for frustum culling — assign the player camera
     public GameObject chunkPrefab;
+
+    /// <summary>Chunk cell size in world units (XZ); assigned in <see cref="Start"/>.</summary>
+    public float CellWorldSize { get; private set; }
 
     // -----------------------------------------------------------------------
 
@@ -307,6 +313,7 @@ public class OctreeGrid : MonoBehaviour
     {
         int nodeResolution = (int)Mathf.Pow(2, divisions - 1);
         cellSize = chunkResolution * nodeResolution;
+        CellWorldSize = cellSize;
 
         if (WorldModifications.Instance != null)
         {
@@ -425,7 +432,7 @@ public class OctreeGrid : MonoBehaviour
         if ((worldSizeX > 0f || worldSizeZ > 0f) && (terrainRebased || playerCellChanged))
             Physics.SyncTransforms();
 
-        if (_seamProximity01 > 0f && Time.time - _lastSeamLogTime > 0.5f)
+        if (logSeamTransition && _seamProximity01 > 0f && Time.time - _lastSeamLogTime > 0.5f)
         {
             _lastSeamLogTime = Time.time;
             UnityEngine.Debug.Log($"[OctreeGrid][Seam] proximity={_seamProximity01:F2} extraCells={_seamExtraCells} active={activeCells.Count} pending={pendingCells.Count}");

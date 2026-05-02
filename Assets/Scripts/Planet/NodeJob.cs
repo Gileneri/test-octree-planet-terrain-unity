@@ -806,13 +806,9 @@ public struct NodeJob : IJob
             }
         }
 
-        // Horizontal toroidal coords:
-        // Layer 1 keys use linear PosMod (matches WorldModifications.WrapKey).
-        // Surface height uses torus embedding (cx,sx,cz,sz) so noise is C¹ across wx=0≡worldSize.
-        // Caves and geological borders MUST use that same embedding — sampling GetNoise(wx,wz)
-        // with linear wx,wz creates a visible seam because noise is not periodic in plane coords.
-        ComputeToroidalNoiseCoords(wp.x, wp.z,
-            out _, out _, out float cx, out _, out float cz, out _);
+        // Layer 1 keys: linear PosMod (matches WorldModifications.WrapKey).
+        // Layer 2 surface: torus embedding in SampleSurfaceHeight (C¹ across wx=0≡worldSize).
+        // Caves + geo borders: world XZ (planar) — previous look; may show seam at period boundaries.
 
         // ── Layer 2 : Procedural surface ──────────────────────────────────
         float maxSurface = surfaceBaseHeight + surfaceNoiseAmplitude;
@@ -851,7 +847,7 @@ public struct NodeJob : IJob
                     ? math.saturate(depthBelowSurface / caveSurfaceFadeRange)
                     : 1f;
 
-                float cn = caveNoise.GetNoise(cx, wp.y * caveNoiseAmplitudeY, cz);
+                float cn = caveNoise.GetNoise(wp.x, wp.y * caveNoiseAmplitudeY, wp.z);
                 float effectiveThreshold = math.lerp(1f, caveNoiseThreshold, fade);
 
                 if (cn > effectiveThreshold)
@@ -871,7 +867,7 @@ public struct NodeJob : IJob
 
                 // Use the pre-created border noise instance for this layer
                 var bn = borderNoises[i];
-                float borderDisplace = bn.GetNoise(cx, cz)
+                float borderDisplace = bn.GetNoise(wp.x, wp.z)
                                        * layer.borderNoiseAmplitude;
                 float layerTopDepth = layer.baseDepth + borderDisplace;
 

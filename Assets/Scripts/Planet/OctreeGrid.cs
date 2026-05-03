@@ -165,6 +165,42 @@ public class OctreeGrid : MonoBehaviour
     [Tooltip("Max octree node subdivisions per cell per frame.")]
     public int maxNodeCreationsPerFrame = 50;
 
+    [Header("Far Distance Heightmap")]
+    [Tooltip("Renders a distant runtime heightmap ring via moving grid + vertex displacement.")]
+    public bool enableFarDistanceHeightmap = true;
+
+    [Tooltip("Optional material override. If null, uses Voxel Void/FarDistanceHeightmap shader.")]
+    public Material farDistanceMaterialOverride;
+    [Tooltip("Optional compute shader override for far height generation.")]
+    public ComputeShader farDistanceComputeShader;
+
+    [Min(512f)] public float farDistanceGridWorldSize = 50000f;
+    [Range(32, 512)] public int farDistanceGridResolution = 128;
+    [Range(128, 2048)] public int farDistanceHeightTextureResolution = 512;
+    [Min(0.02f)] public float farDistanceHeightRefreshSeconds = 1.2f;
+    [Tooltip("If off, far heightmap is rebuilt only when parameters change.")]
+    public bool farDistancePeriodicRefresh = false;
+
+    [Min(0f)] public float farDistanceFadeStart = 1800f;
+    [Min(0f)] public float farDistanceFadeEnd = 3600f;
+    [Min(0f)] public float farDistanceFarFadeStart = 20000f;
+    [Min(0f)] public float farDistanceFarFadeEnd = 28000f;
+    [Range(0f, 1f)] public float farDistanceFogHorizonMix = 0.65f;
+    public Color farDistanceHorizonFogColor = new Color(0.55f, 0.58f, 0.62f, 1f);
+    [Tooltip("Skybox-style far depth: reversed-Z uses z=w*epsilon; classic uses z=w*(1-epsilon).")]
+    [Min(1e-7f)] public float farDistanceBackgroundClipEpsilon = 1e-5f;
+    [Min(0f)] public float farDistanceUnderlayYOffset = 0f;
+    public Color farDistanceColor = new Color(0.40f, 0.42f, 0.45f, 1f);
+    [Tooltip("3D hole around player: inside inner radius the far shell is fully faded; outer radius full strength.")]
+    [Min(0f)] public float farDistancePlayerHoleInner = 400f;
+    [Min(1f)] public float farDistancePlayerHoleOuter = 3600f;
+    [Tooltip("Fade far only when deep below minSubsurfaceHeight (bedrock). Off = no Y-based underground fade (fixes valleys).")]
+    public bool farDistanceDeepUndergroundFarFade = false;
+    [Tooltip("Meters below bedrock Y before underground fade begins (only if farDistanceDeepUndergroundFarFade).")]
+    [Min(0f)] public float farDistanceUndergroundFadeStart = 32f;
+    [Tooltip("Meters below bedrock Y where far is fully faded.")]
+    [Min(1f)] public float farDistanceUndergroundFadeEnd = 400f;
+
     [Header("Underground Culling")]
     [Tooltip("Enable hard node-level culling below a fixed underground altitude.")]
     public bool enableUndergroundNodeCull = false;
@@ -238,7 +274,8 @@ public class OctreeGrid : MonoBehaviour
 
     [Header("References")]
     public Transform priority;
-    public Camera playerCamera;   // used for frustum culling — assign the player camera
+    [Tooltip("Gameplay camera for octree frustum culling. If null, frustum checks are skipped.")]
+    public Camera playerCamera;
     public GameObject chunkPrefab;
 
     /// <summary>Chunk cell size in world units (XZ); assigned in <see cref="Start"/>.</summary>
@@ -279,6 +316,7 @@ public class OctreeGrid : MonoBehaviour
     private int _seamExtraCells;
     private float _lastSeamLogTime = float.NegativeInfinity;
     private readonly List<Vector2Int> _seamPrefetchCentres = new List<Vector2Int>(4);
+    private FarDistanceHeightmapController _farDistanceController;
 
     /// <summary>
     /// When the priority transform is moved by a toroidal wrap (delta = newPos - oldPos),
@@ -311,6 +349,10 @@ public class OctreeGrid : MonoBehaviour
 
     private void Start()
     {
+        _farDistanceController = GetComponent<FarDistanceHeightmapController>();
+        if (_farDistanceController == null)
+            _farDistanceController = gameObject.AddComponent<FarDistanceHeightmapController>();
+
         int nodeResolution = (int)Mathf.Pow(2, divisions - 1);
         cellSize = chunkResolution * nodeResolution;
         CellWorldSize = cellSize;
@@ -473,6 +515,34 @@ public class OctreeGrid : MonoBehaviour
 
         if (_meshingStopwatch.ElapsedMilliseconds > 5)
             UnityEngine.Debug.Log($"[OctreeGrid] meshing {_meshingStopwatch.ElapsedMilliseconds} ms  scheduled={scheduledCount} completed={completedCount} inFlight={inFlightJobs.Count} interactivePending={interactivePendingJobs.Count} next={_dynamicJobsPerFrame}");
+
+        if (_farDistanceController != null)
+        {
+            _farDistanceController.enabledSystem = enableFarDistanceHeightmap;
+            _farDistanceController.materialOverride = farDistanceMaterialOverride;
+            _farDistanceController.gridWorldSize = farDistanceGridWorldSize;
+            _farDistanceController.gridResolution = farDistanceGridResolution;
+            _farDistanceController.heightTextureResolution = farDistanceHeightTextureResolution;
+            _farDistanceController.heightRefreshSeconds = farDistanceHeightRefreshSeconds;
+            _farDistanceController.periodicHeightRefresh = farDistancePeriodicRefresh;
+            _farDistanceController.computeShaderOverride = farDistanceComputeShader;
+            _farDistanceController.fadeStartDistance = farDistanceFadeStart;
+            _farDistanceController.fadeEndDistance = farDistanceFadeEnd;
+            _farDistanceController.farFadeStartDistance = farDistanceFarFadeStart;
+            _farDistanceController.farFadeEndDistance = farDistanceFarFadeEnd;
+            _farDistanceController.fogHorizonMix = farDistanceFogHorizonMix;
+            _farDistanceController.horizonFogColor = farDistanceHorizonFogColor;
+            _farDistanceController.backgroundClipEpsilon = farDistanceBackgroundClipEpsilon;
+            _farDistanceController.underlayYOffset = farDistanceUnderlayYOffset;
+            _farDistanceController.playerHoleInnerRadius = farDistancePlayerHoleInner;
+            _farDistanceController.playerHoleOuterRadius = farDistancePlayerHoleOuter;
+            _farDistanceController.deepUndergroundFarFade = farDistanceDeepUndergroundFarFade;
+            _farDistanceController.undergroundFadeStartM = farDistanceUndergroundFadeStart;
+            _farDistanceController.undergroundFadeEndM = farDistanceUndergroundFadeEnd;
+            _farDistanceController.farColor = farDistanceColor;
+            _farDistanceController.ConfigureFromGrid(this);
+            _farDistanceController.Tick(this);
+        }
     }
 
     private void OnDestroy()

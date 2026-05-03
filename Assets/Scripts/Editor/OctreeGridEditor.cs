@@ -12,6 +12,30 @@ public class OctreeGridEditor : Editor
         public Keyframe[] keys;
     }
 
+    private struct FarDistancePreset
+    {
+        public string name;
+        public string description;
+        public bool enabled;
+        public float gridSize;
+        public int gridResolution;
+        public int texResolution;
+        public float refreshSeconds;
+        public float nearStart;
+        public float nearEnd;
+        public float farStart;
+        public float farEnd;
+        public float fogHorizonMix;
+        public float backgroundClipEpsilon;
+        public float playerHoleInner;
+        public float playerHoleOuter;
+        public bool deepUndergroundFade;
+        public float undergroundFadeStart;
+        public float undergroundFadeEnd;
+        public bool periodicRefresh;
+        public float underlayYOffset;
+    }
+
     // Raios estimados para divisions=7, chunkResolution=8.
     // Esta versao prioriza testes de "fino um pouco mais longe" sem alterar
     // a arquitetura: mexe apenas na lodDistanceCurve.
@@ -96,7 +120,104 @@ public class OctreeGridEditor : Editor
         },
     };
 
+    private static readonly FarDistancePreset[] FarPresets = new FarDistancePreset[]
+    {
+        new FarDistancePreset
+        {
+            name = "Far Off",
+            description = "Desliga o far distance heightmap para baseline puro da octree.",
+            enabled = false,
+            gridSize = 10000f,
+            gridResolution = 128,
+            texResolution = 512,
+            refreshSeconds = 1.0f,
+            nearStart = 999999f,
+            nearEnd = 1000000f,
+            farStart = 1000001f,
+            farEnd = 1000002f,
+            fogHorizonMix = 0f,
+            backgroundClipEpsilon = 1e-5f,
+            playerHoleInner = 400f,
+            playerHoleOuter = 3600f,
+            deepUndergroundFade = false,
+            undergroundFadeStart = 32f,
+            undergroundFadeEnd = 400f,
+            periodicRefresh = false,
+            underlayYOffset = 0f,
+        },
+        new FarDistancePreset
+        {
+            name = "Far Safe",
+            description = "Preset inicial estavel: transicao longa e custo moderado.",
+            enabled = true,
+            gridSize = 50000f,
+            gridResolution = 128,
+            texResolution = 512,
+            refreshSeconds = 2.0f,
+            nearStart = 1800f,
+            nearEnd = 3600f,
+            farStart = 20000f,
+            farEnd = 28000f,
+            fogHorizonMix = 0.55f,
+            backgroundClipEpsilon = 1e-5f,
+            playerHoleInner = 400f,
+            playerHoleOuter = 3600f,
+            deepUndergroundFade = false,
+            undergroundFadeStart = 32f,
+            undergroundFadeEnd = 400f,
+            periodicRefresh = false,
+            underlayYOffset = 0f,
+        },
+        new FarDistancePreset
+        {
+            name = "Far Quality",
+            description = "Visual mais suave no horizonte (custo GPU maior).",
+            enabled = true,
+            gridSize = 50000f,
+            gridResolution = 192,
+            texResolution = 1024,
+            refreshSeconds = 1.5f,
+            nearStart = 2200f,
+            nearEnd = 4200f,
+            farStart = 26000f,
+            farEnd = 34000f,
+            fogHorizonMix = 0.65f,
+            backgroundClipEpsilon = 8e-6f,
+            playerHoleInner = 500f,
+            playerHoleOuter = 4200f,
+            deepUndergroundFade = false,
+            undergroundFadeStart = 32f,
+            undergroundFadeEnd = 400f,
+            periodicRefresh = false,
+            underlayYOffset = 0f,
+        },
+        new FarDistancePreset
+        {
+            name = "Far Performance",
+            description = "Prioriza FPS: malha/textura menores e refresh mais espaçado.",
+            enabled = true,
+            gridSize = 50000f,
+            gridResolution = 128,
+            texResolution = 512,
+            refreshSeconds = 3.0f,
+            nearStart = 1600f,
+            nearEnd = 3000f,
+            farStart = 18000f,
+            farEnd = 24000f,
+            fogHorizonMix = 0.45f,
+            backgroundClipEpsilon = 1.2e-5f,
+            playerHoleInner = 350f,
+            playerHoleOuter = 3200f,
+            deepUndergroundFade = false,
+            undergroundFadeStart = 32f,
+            undergroundFadeEnd = 400f,
+            periodicRefresh = false,
+            underlayYOffset = 0f,
+        },
+    };
+
     private bool presetsFoldout = true;
+    private bool farPresetsFoldout = true;
     private bool rebakeNeeded = false;
 
     public override void OnInspectorGUI()
@@ -106,6 +227,8 @@ public class OctreeGridEditor : Editor
 
         EditorGUILayout.Space(4);
         DrawPresetsSection();
+        EditorGUILayout.Space(4);
+        DrawFarPresetsSection();
 
         if (rebakeNeeded)
             DrawRebakeButton();
@@ -173,6 +296,36 @@ public class OctreeGridEditor : Editor
         GUI.backgroundColor = Color.white;
     }
 
+    private void DrawFarPresetsSection()
+    {
+        farPresetsFoldout = EditorGUILayout.BeginFoldoutHeaderGroup(farPresetsFoldout, "Presets Far Distance Heightmap");
+        if (farPresetsFoldout)
+        {
+            EditorGUILayout.HelpBox(
+                "Presets iniciais para validar custo/beneficio do horizonte distante.\n" +
+                "Fluxo recomendado: Far Off -> Far Safe -> Far Quality/Performance.\n" +
+                "Use o Profiler para comparar batches, GPU frame time e estabilidade visual.",
+                MessageType.Info);
+
+            foreach (var preset in FarPresets)
+            {
+                EditorGUILayout.BeginVertical(EditorStyles.helpBox);
+                EditorGUILayout.BeginHorizontal();
+                GUILayout.Label(preset.name, EditorStyles.boldLabel);
+                if (GUILayout.Button("Aplicar", GUILayout.Width(70)))
+                    ApplyFarPreset(preset);
+                EditorGUILayout.EndHorizontal();
+
+                var style = new GUIStyle(EditorStyles.miniLabel)
+                { wordWrap = true, normal = { textColor = new Color(0.6f, 0.6f, 0.6f) } };
+                GUILayout.Label(preset.description, style);
+                EditorGUILayout.EndVertical();
+                EditorGUILayout.Space(2);
+            }
+        }
+        EditorGUILayout.EndFoldoutHeaderGroup();
+    }
+
     private void ApplyPreset(LodPreset preset)
     {
         var grid = (OctreeGrid)target;
@@ -183,6 +336,32 @@ public class OctreeGridEditor : Editor
             AnimationUtility.SetKeyLeftTangentMode(curve, i, AnimationUtility.TangentMode.Auto);
 
         grid.lodDistanceCurve = curve;
+        EditorUtility.SetDirty(grid);
+    }
+
+    private void ApplyFarPreset(FarDistancePreset preset)
+    {
+        var grid = (OctreeGrid)target;
+        Undo.RecordObject(grid, "Far Preset: " + preset.name);
+
+        grid.enableFarDistanceHeightmap = preset.enabled;
+        grid.farDistanceGridWorldSize = preset.gridSize;
+        grid.farDistanceGridResolution = preset.gridResolution;
+        grid.farDistanceHeightTextureResolution = preset.texResolution;
+        grid.farDistanceHeightRefreshSeconds = preset.refreshSeconds;
+        grid.farDistanceFadeStart = preset.nearStart;
+        grid.farDistanceFadeEnd = preset.nearEnd;
+        grid.farDistanceFarFadeStart = preset.farStart;
+        grid.farDistanceFarFadeEnd = preset.farEnd;
+        grid.farDistanceFogHorizonMix = preset.fogHorizonMix;
+        grid.farDistanceBackgroundClipEpsilon = preset.backgroundClipEpsilon;
+        grid.farDistancePlayerHoleInner = preset.playerHoleInner;
+        grid.farDistancePlayerHoleOuter = preset.playerHoleOuter;
+        grid.farDistanceDeepUndergroundFarFade = preset.deepUndergroundFade;
+        grid.farDistanceUndergroundFadeStart = preset.undergroundFadeStart;
+        grid.farDistanceUndergroundFadeEnd = preset.undergroundFadeEnd;
+        grid.farDistancePeriodicRefresh = preset.periodicRefresh;
+        grid.farDistanceUnderlayYOffset = preset.underlayYOffset;
         EditorUtility.SetDirty(grid);
     }
 }

@@ -1,0 +1,48 @@
+#pragma kernel CSMain
+
+RWTexture2D<float> Result;
+
+int _Resolution;
+float _WorldSizeX;
+float _WorldSizeZ;
+int _NoiseSeed;
+int _NoiseTypeId;
+float _SurfaceBaseHeight;
+float _SurfaceAmplitude;
+
+float Hash21(float2 p)
+{
+    float h = dot(p, float2(127.1, 311.7));
+    return frac(sin(h) * 43758.5453123);
+}
+
+float ValueNoise(float2 p)
+{
+    float2 i = floor(p);
+    float2 f = frac(p);
+    float a = Hash21(i + float2(_NoiseSeed * 0.001, _NoiseSeed * 0.001));
+    float b = Hash21(i + float2(1, 0) + float2(_NoiseSeed * 0.001, _NoiseSeed * 0.001));
+    float c = Hash21(i + float2(0, 1) + float2(_NoiseSeed * 0.001, _NoiseSeed * 0.001));
+    float d = Hash21(i + float2(1, 1) + float2(_NoiseSeed * 0.001, _NoiseSeed * 0.001));
+    float2 u = f * f * (3.0 - 2.0 * f);
+    return lerp(lerp(a, b, u.x), lerp(c, d, u.x), u.y);
+}
+
+[numthreads(8, 8, 1)]
+void CSMain(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_Resolution || id.y >= (uint)_Resolution) return;
+
+    float2 uv = (float2(id.xy) + 0.5) / max(1.0, (float)_Resolution);
+    float wx = uv.x * max(1.0, _WorldSizeX);
+    float wz = uv.y * max(1.0, _WorldSizeZ);
+
+    float2 f = float2(wx, wz) * 0.003;
+    float n1 = ValueNoise(f);
+    float n2 = ValueNoise(f * 1.9 + 13.37);
+    float n3 = ValueNoise(f * 3.7 + 37.13);
+    float n = n1 * 0.6 + n2 * 0.3 + n3 * 0.1;
+
+    // Map to [0,1], consistent with shader decode.
+    Result[id.xy] = saturate(n);
+}

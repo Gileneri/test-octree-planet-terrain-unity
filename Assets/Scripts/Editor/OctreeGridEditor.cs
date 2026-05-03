@@ -12,16 +12,20 @@ public class OctreeGridEditor : Editor
         public Keyframe[] keys;
     }
 
-    // Raios estimados para divisions=7, chunkResolution=8
-    // Estrategia: niveis finos (lv0-3) ficam com mult BAIXO (perto do player)
-    //             niveis grossos (lv4-6) tem mult ALTO (horizonte detalhado)
-    // Isso evita a explosao cubica de nos que trava o jogo.
+    // Raios estimados para divisions=7, chunkResolution=8.
+    // Esta versao prioriza testes de "fino um pouco mais longe" sem alterar
+    // a arquitetura: mexe apenas na lodDistanceCurve.
+    //
+    // Estrategia:
+    // - Mantem lv4-6 com crescimento progressivo (horizonte detalhado).
+    // - Sobe levemente lv0-3 para empurrar detalhe fino para mais longe.
+    // - Evita saltos bruscos perto de X=0.5 para reduzir churn de subdivisao.
     private static readonly LodPreset[] Presets = new LodPreset[]
     {
         new LodPreset
         {
-            name = "Performance",
-            description = "Tudo perto do player. Minimo de nos. Para maquinas fracas ou debug.\n~130 nos totais  |  lv0: 16u  lv6: 768u",
+            name = "Performance Atual",
+            description = "Base conservadora para FPS alto. Bom para comparar com presets mais finos.\n~130 nos totais  |  lv0: 16u  lv6: 768u",
             keys = new[]
             {
                 new Keyframe(0f, 2f),
@@ -30,8 +34,8 @@ public class OctreeGridEditor : Editor
         },
         new LodPreset
         {
-            name = "Padrao",
-            description = "Balanceado. Niveis finos perto, niveis grossos um pouco mais longe.\n~500 nos totais  |  lv0: 16u  lv6: 1024u",
+            name = "Padrao Atual",
+            description = "Referencia balanceada do projeto. Mantem finos mais perto e custo previsivel.\n~500 nos totais  |  lv0: 16u  lv6: 1024u",
             keys = new[]
             {
                 new Keyframe(0f, 2f),
@@ -41,37 +45,53 @@ public class OctreeGridEditor : Editor
         },
         new LodPreset
         {
-            name = "Horizonte Suave",
-            description = "Finos perto (mult=2), grossos esticados ate 5x. Bom visual sem custo excessivo.\n~1800 nos totais  |  lv0: 16u  lv6: 2560u",
+            name = "Fino+ Curto Alcance",
+            description = "Primeiro passo para detalhe fino mais longe: aumenta discretamente lv0-3.\n~800-1200 nos  |  lv0: 19u  lv3: 166u  lv6: 1536u",
             keys = new[]
             {
-                new Keyframe(0f, 2f),
-                new Keyframe(0.55f, 2f),
-                new Keyframe(1f, 5f),
+                new Keyframe(0f, 2.4f),
+                new Keyframe(0.35f, 2.3f),
+                new Keyframe(0.6f, 2.8f),
+                new Keyframe(1f, 3f),
             }
         },
         new LodPreset
         {
-            name = "Horizonte Detalhado",
-            description = "Finos perto, grossos bem esticados. Horizonte notavelmente mais rico.\n~3400 nos totais  |  lv0: 16u  lv6: 4096u",
+            name = "Fino+ Medio Alcance",
+            description = "Detalhe fino claramente mais distante, mantendo transicao suave para lv4-6.\n~1600-2400 nos  |  lv0: 22u  lv3: 205u  lv6: 2304u",
             keys = new[]
             {
-                new Keyframe(0f, 2f),
-                new Keyframe(0.5f, 2f),
-                new Keyframe(0.7f, 4f),
+                new Keyframe(0f, 2.8f),
+                new Keyframe(0.35f, 2.7f),
+                new Keyframe(0.6f, 3.3f),
+                new Keyframe(0.8f, 4f),
+                new Keyframe(1f, 4.5f),
+            }
+        },
+        new LodPreset
+        {
+            name = "Fino+ Longo Alcance",
+            description = "Teste agressivo para validar limite do hardware: fino longe e horizonte denso.\n~2800-4200 nos  |  lv0: 26u  lv3: 243u  lv6: 3072u",
+            keys = new[]
+            {
+                new Keyframe(0f, 3.2f),
+                new Keyframe(0.35f, 3.1f),
+                new Keyframe(0.6f, 3.8f),
+                new Keyframe(0.8f, 5f),
+                new Keyframe(1f, 6f),
+            }
+        },
+        new LodPreset
+        {
+            name = "Fino+ Estresse",
+            description = "Stress test para encontrar teto de desempenho com detalhe fino distante.\n~4500+ nos  |  lv0: 29u  lv3: 282u  lv6: 4096u",
+            keys = new[]
+            {
+                new Keyframe(0f, 3.6f),
+                new Keyframe(0.35f, 3.5f),
+                new Keyframe(0.6f, 4.4f),
+                new Keyframe(0.8f, 5.8f),
                 new Keyframe(1f, 8f),
-            }
-        },
-        new LodPreset
-        {
-            name = "Horizonte Maximo",
-            description = "Finos perto, grossos extremamente longe. Pesado — aumente maxJobsPerFrame para 300+.\n~8000 nos totais  |  lv0: 16u  lv6: 7168u",
-            keys = new[]
-            {
-                new Keyframe(0f, 2f),
-                new Keyframe(0.5f, 2f),
-                new Keyframe(0.65f, 5f),
-                new Keyframe(1f, 14f),
             }
         },
     };
@@ -102,9 +122,9 @@ public class OctreeGridEditor : Editor
                 "Clique em Aplicar para sobrescrever a lodDistanceCurve acima.\n" +
                 "Os raios e contagens assumem divisions=7 e chunkResolution=8.\n" +
                 "Depois clique em Rebake & Apply para ver o efeito sem reiniciar.\n\n" +
-                "DICA: a curva deve ser PLANA nos niveis finos (X=0 a 0.5) e\n" +
-                "subir apenas nos niveis grossos (X=0.5 a 1.0) para evitar\n" +
-                "explosao de nos e travamentos.",
+                "Nesta versao os presets Fino+ aumentam gradualmente X=0..0.6\n" +
+                "para levar detalhe fino mais longe sem alterar a estrutura.\n" +
+                "Teste em ordem: Curto -> Medio -> Longo -> Estresse.",
                 MessageType.Info);
 
             EditorGUILayout.Space(2);

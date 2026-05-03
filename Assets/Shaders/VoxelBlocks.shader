@@ -38,6 +38,7 @@ Shader "Voxel Void/VoxelBlocks"
 
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Lighting.hlsl"
+            #include "Include/PlanetCurvature.hlsl"
 
             // ── Texture array ────────────────────────────────────────────
             TEXTURE2D_ARRAY(_TextureArray);
@@ -83,12 +84,14 @@ Shader "Voxel Void/VoxelBlocks"
                 VertexPositionInputs posInputs = GetVertexPositionInputs(IN.positionOS);
                 VertexNormalInputs   nrmInputs = GetVertexNormalInputs(IN.normalOS);
 
-                OUT.positionCS = posInputs.positionCS;
-                OUT.positionWS = posInputs.positionWS;
+                float3 ws = posInputs.positionWS;
+                ws.y -= SphericalCurvatureDropY(ws.xz, _CurvatureRefWS.xz, _PlanetCurvatureRadius);
+                OUT.positionCS = TransformWorldToHClip(ws);
+                OUT.positionWS = ws;
                 OUT.normalWS   = nrmInputs.normalWS;
                 OUT.uv         = IN.uv;
                 OUT.texLayer   = IN.blockData.y;  // y = pre-computed tex array layer
-                OUT.fogFactor  = ComputeFogFactor(posInputs.positionCS.z);
+                OUT.fogFactor  = ComputeFogFactor(OUT.positionCS.z);
 
                 return OUT;
             }
@@ -151,6 +154,7 @@ Shader "Voxel Void/VoxelBlocks"
 
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Lighting.hlsl"
+            #include "Include/PlanetCurvature.hlsl"
 
             CBUFFER_START(UnityPerMaterial)
                 float _Smoothness;
@@ -174,6 +178,7 @@ Shader "Voxel Void/VoxelBlocks"
             {
                 VaryingsShadow OUT;
                 float3 posWS  = TransformObjectToWorld(IN.positionOS);
+                posWS.y -= SphericalCurvatureDropY(posWS.xz, _CurvatureRefWS.xz, _PlanetCurvatureRadius);
                 float3 normWS = TransformObjectToWorldNormal(IN.normalOS);
                 Light  mainLight = GetMainLight();
                 OUT.positionCS   = TransformWorldToHClip(
@@ -201,6 +206,7 @@ Shader "Voxel Void/VoxelBlocks"
             #pragma fragment fragDepth
 
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
+            #include "Include/PlanetCurvature.hlsl"
 
             struct AttributesDepth { float3 positionOS : POSITION; float2 uv : TEXCOORD0; float2 bd : TEXCOORD1; };
             struct VaryingsDepth   { float4 positionCS : SV_POSITION; };
@@ -208,7 +214,9 @@ Shader "Voxel Void/VoxelBlocks"
             VaryingsDepth vertDepth(AttributesDepth IN)
             {
                 VaryingsDepth OUT;
-                OUT.positionCS = TransformObjectToHClip(IN.positionOS);
+                float3 ws = TransformObjectToWorld(IN.positionOS);
+                ws.y -= SphericalCurvatureDropY(ws.xz, _CurvatureRefWS.xz, _PlanetCurvatureRadius);
+                OUT.positionCS = TransformWorldToHClip(ws);
                 return OUT;
             }
             half fragDepth(VaryingsDepth IN) : SV_Target { return 0; }

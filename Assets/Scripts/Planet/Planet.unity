@@ -716,10 +716,12 @@ MonoBehaviour:
   farDistanceFarFadeStart: 20000
   farDistanceFarFadeEnd: 28000
   farDistanceFogHorizonMix: 0.65
-  farDistanceHorizonFogColor: {r: 0.15176214, g: 0.49521375, b: 0.9245283, a: 1}
+  farDistanceHorizonFogColor: {r: 0.4264151, g: 0.4264151, b: 0.4264151, a: 1}
   farDistanceBackgroundClipEpsilon: 0.00001
+  farDistancePlanetCurvatureRadius: 200000
+  farDistanceCurvatureUseCameraPosition: 1
   farDistanceUnderlayYOffset: 96
-  farDistanceColor: {r: 1, g: 0.099364564, b: 0.073584795, a: 1}
+  farDistanceColor: {r: 0.6603774, g: 0.6603774, b: 0.6603774, a: 1}
   farDistancePlayerHoleInner: 400
   farDistancePlayerHoleOuter: 3600
   farDistanceDeepUndergroundFarFade: 0

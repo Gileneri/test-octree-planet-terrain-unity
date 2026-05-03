@@ -189,6 +189,10 @@ public class OctreeGrid : MonoBehaviour
     public Color farDistanceHorizonFogColor = new Color(0.55f, 0.58f, 0.62f, 1f);
     [Tooltip("Skybox-style far depth: reversed-Z uses z=w*epsilon; classic uses z=w*(1-epsilon).")]
     [Min(1e-7f)] public float farDistanceBackgroundClipEpsilon = 1e-5f;
+    [Tooltip("Fake sphere: y drop from horizontal distance to ref; 0 = off. Needs R > max visible dst for stable sqrt.")]
+    [Min(0f)] public float farDistancePlanetCurvatureRadius = 0f;
+    [Tooltip("If true, curvature uses playerCamera or Camera.main XZ; else uses Priority XZ.")]
+    public bool farDistanceCurvatureUseCameraPosition = true;
     [Min(0f)] public float farDistanceUnderlayYOffset = 0f;
     public Color farDistanceColor = new Color(0.40f, 0.42f, 0.45f, 1f);
     [Tooltip("3D hole around player: inside inner radius the far shell is fully faded; outer radius full strength.")]
@@ -516,6 +520,8 @@ public class OctreeGrid : MonoBehaviour
         if (_meshingStopwatch.ElapsedMilliseconds > 5)
             UnityEngine.Debug.Log($"[OctreeGrid] meshing {_meshingStopwatch.ElapsedMilliseconds} ms  scheduled={scheduledCount} completed={completedCount} inFlight={inFlightJobs.Count} interactivePending={interactivePendingJobs.Count} next={_dynamicJobsPerFrame}");
 
+        ApplyPlanetCurvatureShaderGlobals();
+
         if (_farDistanceController != null)
         {
             _farDistanceController.enabledSystem = enableFarDistanceHeightmap;
@@ -533,6 +539,8 @@ public class OctreeGrid : MonoBehaviour
             _farDistanceController.fogHorizonMix = farDistanceFogHorizonMix;
             _farDistanceController.horizonFogColor = farDistanceHorizonFogColor;
             _farDistanceController.backgroundClipEpsilon = farDistanceBackgroundClipEpsilon;
+            _farDistanceController.planetCurvatureRadius = farDistancePlanetCurvatureRadius;
+            _farDistanceController.curvatureReferenceUsesCamera = farDistanceCurvatureUseCameraPosition;
             _farDistanceController.underlayYOffset = farDistanceUnderlayYOffset;
             _farDistanceController.playerHoleInnerRadius = farDistancePlayerHoleInner;
             _farDistanceController.playerHoleOuterRadius = farDistancePlayerHoleOuter;
@@ -543,6 +551,20 @@ public class OctreeGrid : MonoBehaviour
             _farDistanceController.ConfigureFromGrid(this);
             _farDistanceController.Tick(this);
         }
+    }
+
+    private void ApplyPlanetCurvatureShaderGlobals()
+    {
+        float r = Mathf.Max(0f, farDistancePlanetCurvatureRadius);
+        Vector3 refPos = priority != null ? priority.position : Vector3.zero;
+        if (farDistanceCurvatureUseCameraPosition)
+        {
+            Camera cam = playerCamera != null ? playerCamera : Camera.main;
+            if (cam != null)
+                refPos = cam.transform.position;
+        }
+        Shader.SetGlobalFloat("_PlanetCurvatureRadius", r);
+        Shader.SetGlobalVector("_CurvatureRefWS", new Vector4(refPos.x, 0f, refPos.z, 1f));
     }
 
     private void OnDestroy()

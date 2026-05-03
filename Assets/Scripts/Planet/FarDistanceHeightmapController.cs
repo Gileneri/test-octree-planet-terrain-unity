@@ -39,6 +39,12 @@ public class FarDistanceHeightmapController : MonoBehaviour
     [Tooltip("Reversed-Z: z = w * epsilon. Classic: z = w * (1 - epsilon). Tune if horizon fights skybox.")]
     [Min(1e-7f)] public float backgroundClipEpsilon = 1e-5f;
 
+    [Header("Planet curvature (fake sphere)")]
+    [Tooltip("Sphere radius R for y -= R - sqrt(R*R - dst^2) in XZ from reference; 0 disables.")]
+    [Min(0f)] public float planetCurvatureRadius = 0f;
+    [Tooltip("If true, horizontal distance uses OctreeGrid.playerCamera or Camera.main; if false, uses Priority position.")]
+    public bool curvatureReferenceUsesCamera = true;
+
     [Header("Look")]
     public Color farColor = new Color(0.40f, 0.42f, 0.45f, 1f);
     public Material materialOverride;

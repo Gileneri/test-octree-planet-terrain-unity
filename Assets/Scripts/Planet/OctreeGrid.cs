@@ -193,6 +193,12 @@ public class OctreeGrid : MonoBehaviour
     [Min(0f)] public float farDistancePlanetCurvatureRadius = 0f;
     [Tooltip("If true, curvature uses playerCamera or Camera.main XZ; else uses Priority XZ.")]
     public bool farDistanceCurvatureUseCameraPosition = true;
+    [Tooltip("0 = same bend at any altitude. Higher = stronger sagitta when the view is far above nominal surface (helps horizon close in orbit).")]
+    [Min(0f)] public float farDistanceCurvatureAltitudeAmplify = 0.9f;
+    [Tooltip("Meters above Surface Base Height before altitude boost starts.")]
+    [Min(0f)] public float farDistanceCurvatureAltitudeRampStart = 300f;
+    [Tooltip("Smaller = boost ramps faster with height (log knee, meters). Try ~600–1500 if orbit still looks flat.")]
+    [Min(1f)] public float farDistanceCurvatureAltitudeLogKnee = 950f;
     [Min(0f)] public float farDistanceUnderlayYOffset = 0f;
     public Color farDistanceColor = new Color(0.40f, 0.42f, 0.45f, 1f);
     [Tooltip("3D hole around player: inside inner radius the far shell is fully faded; outer radius full strength.")]
@@ -557,14 +563,26 @@ public class OctreeGrid : MonoBehaviour
     {
         float r = Mathf.Max(0f, farDistancePlanetCurvatureRadius);
         Vector3 refPos = priority != null ? priority.position : Vector3.zero;
+        float viewY = refPos.y;
         if (farDistanceCurvatureUseCameraPosition)
         {
             Camera cam = playerCamera != null ? playerCamera : Camera.main;
             if (cam != null)
+            {
                 refPos = cam.transform.position;
+                viewY = cam.transform.position.y;
+            }
         }
+        else if (priority != null)
+            viewY = priority.position.y;
+
         Shader.SetGlobalFloat("_PlanetCurvatureRadius", r);
         Shader.SetGlobalVector("_CurvatureRefWS", new Vector4(refPos.x, 0f, refPos.z, 1f));
+        Shader.SetGlobalFloat("_CurvatureViewWorldY", viewY);
+        Shader.SetGlobalFloat("_CurvatureSurfaceWorldY", surfaceBaseHeight);
+        Shader.SetGlobalFloat("_CurvatureAltitudeAmplify", Mathf.Max(0f, farDistanceCurvatureAltitudeAmplify));
+        Shader.SetGlobalFloat("_CurvatureAltitudeRampStart", Mathf.Max(0f, farDistanceCurvatureAltitudeRampStart));
+        Shader.SetGlobalFloat("_CurvatureAltitudeLogKnee", Mathf.Max(1f, farDistanceCurvatureAltitudeLogKnee));
     }
 
     private void OnDestroy()

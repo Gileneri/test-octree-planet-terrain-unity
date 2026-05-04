@@ -114,7 +114,7 @@ Shader "Voxel Void/FarDistanceHeightmap"
                 float h01 = SAMPLE_TEXTURE2D_LOD(_HeightTex, sampler_HeightTex, uvWrap, 0).r;
                 float terrainY = _SurfaceBaseHeight - _SurfaceAmplitude + h01 * (2.0 * _SurfaceAmplitude);
                 ws.y = terrainY - max(0.0, _UnderlayYOffset);
-                ws.y -= SphericalCurvatureDropY(ws.xz, _CurvatureRefWS.xz, _PlanetCurvatureRadius);
+                ws.y -= PlanetCurvatureWorldDropY(ws);
 
                 float4 clipPos = TransformWorldToHClip(ws);
 

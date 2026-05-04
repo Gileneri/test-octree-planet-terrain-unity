@@ -85,7 +85,7 @@ Shader "Voxel Void/VoxelBlocks"
                 VertexNormalInputs   nrmInputs = GetVertexNormalInputs(IN.normalOS);
 
                 float3 ws = posInputs.positionWS;
-                ws.y -= SphericalCurvatureDropY(ws.xz, _CurvatureRefWS.xz, _PlanetCurvatureRadius);
+                ws.y -= PlanetCurvatureWorldDropY(ws);
                 OUT.positionCS = TransformWorldToHClip(ws);
                 OUT.positionWS = ws;
                 OUT.normalWS   = nrmInputs.normalWS;
@@ -178,7 +178,7 @@ Shader "Voxel Void/VoxelBlocks"
             {
                 VaryingsShadow OUT;
                 float3 posWS  = TransformObjectToWorld(IN.positionOS);
-                posWS.y -= SphericalCurvatureDropY(posWS.xz, _CurvatureRefWS.xz, _PlanetCurvatureRadius);
+                posWS.y -= PlanetCurvatureWorldDropY(posWS);
                 float3 normWS = TransformObjectToWorldNormal(IN.normalOS);
                 Light  mainLight = GetMainLight();
                 OUT.positionCS   = TransformWorldToHClip(
@@ -215,7 +215,7 @@ Shader "Voxel Void/VoxelBlocks"
             {
                 VaryingsDepth OUT;
                 float3 ws = TransformObjectToWorld(IN.positionOS);
-                ws.y -= SphericalCurvatureDropY(ws.xz, _CurvatureRefWS.xz, _PlanetCurvatureRadius);
+                ws.y -= PlanetCurvatureWorldDropY(ws);
                 OUT.positionCS = TransformWorldToHClip(ws);
                 return OUT;
             }
